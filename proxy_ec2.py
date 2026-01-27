@@ -24,18 +24,18 @@ RK_TTL_SECONDS = 3600
 ENCLAVE_CID = 16  # CID for VSOCK connection to enclave (parent VM is typically 3, enclave is assigned)
 ENCLAVE_PORT = 12345
 
-# Global Redis connection pool
 redis_pool = None
+w3_client = None
 
 
 # helper functions for blockchain interaction
 async def get_web3():
-    """Get an AsyncWeb3 instance with WebSocket provider."""
-    from web3.providers import WebSocketProvider
-
-    provider = WebSocketProvider(RPC_URL)
-    w3 = AsyncWeb3(provider)
-    return w3
+    """Get a Web3 instance with WebSocket provider."""
+    global w3_client
+    if w3_client is None:
+        # Fallback if accessed before startup for some reason, though shouldn't happen with correct lifecycle
+        w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
+    return w3_client
 
 
 async def get_contract():
@@ -193,13 +193,13 @@ async def event_listener():
 
             if current_block > latest_block:
                 # Fetch AccessGranted events
-                access_granted_events = await contract.events.AccessGranted.get_logs(
-                    fromBlock=latest_block + 1, toBlock=current_block
+                access_granted_events = await contract.events.accessGranted.get_logs(
+                    from_block=latest_block + 1, to_block=current_block
                 )
 
                 # Fetch AccessDenied events
-                access_denied_events = await contract.events.AccessDenied.get_logs(
-                    fromBlock=latest_block + 1, toBlock=current_block
+                access_denied_events = await contract.events.accessDenied.get_logs(
+                    from_block=latest_block + 1, to_block=current_block
                 )
 
                 # Handle AccessGranted events
@@ -317,9 +317,21 @@ async def forward_enclave(payload: bytes) -> bytes | None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global redis_pool
+    global redis_pool, w3_client
     # runs on startup
     redis_pool = await redis.from_url(REDIS_URL)
+
+    # Initialize Web3
+    w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
+    try:
+        await w3_client.provider.connect()
+        if await w3_client.is_connected():
+            print(f"Connected to Ethereum node at {RPC_URL}")
+        else:
+            print(f"Failed to connect to Ethereum node at {RPC_URL}")
+    except Exception as e:
+        print(f"Error connecting to Ethereum node: {e}")
+
     task = asyncio.create_task(event_listener())
     yield
     # runs on shutdown
@@ -335,13 +347,21 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# CORS middleware for browser requests
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:5174",
+    "http://localhost:5175",
+]
+
+# Add origins from env var
+env_origins = os.getenv("ALLOWED_ORIGINS")
+if env_origins:
+    allowed_origins.extend([o.strip() for o in env_origins.split(",")])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],  # Vite/React dev servers
+    allow_origins=allowed_origins,  # Vite/React dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -358,7 +378,7 @@ async def get_nonce():
     """Generate a nonce for SIWE authentication."""
     import time
 
-    nonce = secrets.token_urlsafe(16)
+    nonce = secrets.token_hex(16)
     nonce_store[nonce] = time.time()
 
     # Clean up expired nonces
@@ -478,15 +498,34 @@ async def decrypt_capsule(request: Request):
                 print(f"Warning: Could not verify on-chain access: {e}")
 
         print(f"[EC2] Decrypt capsule request for {address}")
+        ciphertext_hex = None
+        try:
+            print(f"[EC2] Fetching ciphertext from blockchain for {cid}")
+            file_data = await fetch_file_blockchain(cid)
+            # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
+            # Index 3 is ciphertext bytes
+            ciphertext_bytes = file_data[3]
+            ciphertext_hex = ciphertext_bytes.hex()
+        except Exception as e:
+            print(f"[EC2] Failed to fetch ciphertext from chain: {e}")
+            return {
+                "status": "error",
+                "message": "Failed to fetch ciphertext from blockchain",
+            }
+
+        if not ciphertext_hex:
+            return {"status": "error", "message": "Ciphertext not found on-chain"}
+
         # Forward to enclave for decryption
         payload = json.dumps(
             {
                 "action": "decrypt_capsule",
                 "address": address,
                 "capsule": capsule_hex,
+                "ciphertext": ciphertext_hex,  # Pass ciphertext to enclave
                 "cid": cid,
                 "is_reencrypted": is_reencrypted,
-                "owner": owner_address,
+                "owner": owner_address or "",
                 "signature": body.get("signature"),
                 "message": body.get("message"),
             }

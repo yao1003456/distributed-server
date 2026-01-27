@@ -142,8 +142,8 @@ class EnclaveServer:
 
         Returns: Serialized KeyFrag bytes
         """
-        owner = request.get("owner", "").lower()
-        requester = request.get("requester", "").lower()
+        owner = (request.get("owner") or "").lower()
+        requester = (request.get("requester") or "").lower()
         print(f"[ENCLAVE] generating re-encryption key from {owner} to {requester}")
 
         if not owner or not requester:
@@ -227,7 +227,6 @@ class EnclaveServer:
             return self._error_response("Missing address")
 
         if self.key_store.has_user(address):
-            # Return existing public key if already registered
             existing_keys = self.key_store.get_user_keys(address)
             if existing_keys:
                 return self._success_response(
@@ -255,10 +254,12 @@ class EnclaveServer:
 
             self.key_store.store_user_keys(address, key_pair)
 
-            return self._success_response(
-                bytes(public_key),
-                metadata={"verifying_key": bytes(verifying_key).hex()},
-            )
+            response = {
+                "status": "success",
+                "public_key": bytes(public_key).hex(),
+                "verifying_key": bytes(verifying_key).hex(),
+            }
+            return json.dumps(response).encode("utf-8")
 
         except Exception as e:
             return self._error_response(f"Registration failed: {str(e)}")
@@ -299,17 +300,15 @@ class EnclaveServer:
             # Should not happen since we check has_user above, but handle anyway
             return await self.handle_register(request)
 
-        # Generate a session token (in production, use proper JWT or similar)
+        # TODO: Generate a session token (in production, use proper JWT or similar)
         session_token = secrets.token_hex(32)
 
-        # SECURITY: Only return public key - secret key NEVER leaves enclave!
         response_data = {
             "status": "success",
             "address": address,
             "public_key": bytes(user_keys.public_key).hex(),
             "verifying_key": bytes(user_keys.verifying_key).hex(),
             "session_token": session_token,
-            # NOTE: sk is NOT returned - it stays securely in the enclave
         }
 
         print(f"[ENCLAVE] Login successful for {address}")
@@ -338,12 +337,12 @@ class EnclaveServer:
         """
         from umbral import Capsule, CapsuleFrag, decrypt_original, decrypt_reencrypted
 
-        address = request.get("address", "").lower()
+        address = (request.get("address") or "").lower()
         capsule_hex = request.get("capsule", "")
         ciphertext_hex = request.get("ciphertext", "")
         cid = request.get("cid", "")
         is_reencrypted = request.get("is_reencrypted", False)
-        owner = request.get("owner", "").lower()
+        owner = (request.get("owner") or "").lower()
 
         print(
             f"[ENCLAVE] Decrypt request for {address}, cid={cid}, is_reencrypted={is_reencrypted}"
@@ -535,8 +534,6 @@ class VSockServer:
                 writer.write(response_length + response)
                 await writer.drain()
 
-        except asyncio.IncompleteReadError:
-            print(f"Client {peer} disconnected")
         except Exception as e:
             print(f"Error handling client {peer}: {e}")
         finally:
