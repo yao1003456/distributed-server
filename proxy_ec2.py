@@ -9,7 +9,7 @@ from fastapi.concurrency import asynccontextmanager
 from web3 import AsyncWeb3, Web3
 from siwe import SiweMessage
 from socket_utils import get_socket_type, get_connection_address
-from umbral import Capsule, KeyFrag, reencrypt, PublicKey
+from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
 from dotenv import load_dotenv
 
@@ -156,24 +156,18 @@ async def reencrypt_capsule(
         Serialized CapsuleFrag
     """
     try:
-        # Deserialize the capsule
         capsule = Capsule.from_bytes(capsule_bytes)
 
-        # Deserialize keys for verification
-        owner_pk = PublicKey.from_bytes(owner_pk_bytes)
-        requester_pk = PublicKey.from_bytes(requester_pk_bytes)
+        owner_pk = PublicKey.from_compressed_bytes(owner_pk_bytes)
+        requester_pk = PublicKey.from_compressed_bytes(requester_pk_bytes)
 
-        # Deserialize and verify the key fragment
-        # KeyFrag must be verified before use in reencryption
         kfrag = KeyFrag.from_bytes(rk_bytes)
         verified_kfrag = kfrag.verify(
             verifying_pk=owner_pk, delegating_pk=owner_pk, receiving_pk=requester_pk
         )
 
-        # Perform re-encryption using the module-level function
         cfrag = reencrypt(capsule=capsule, kfrag=verified_kfrag)
 
-        # Return the serialized verified capsule fragment
         return bytes(cfrag)
 
     except Exception as e:

@@ -2,7 +2,7 @@
 Nitro Enclave Proxy Server
 
 Responsibilities:
-1. Secure Key Generation (skPRE, pkPRE) using py-umbral
+1. Secure Key Generation (skPRE, pkPRE) using umbral-pre
 2. Secure storage (Sealed Memory) of user private keys
 3. Re-encryption key generation (rkA→B) upon verified request
 4. TLS Termination (logical) for secure client communication
@@ -17,7 +17,17 @@ import hashlib
 import secrets
 from typing import Optional
 from dataclasses import dataclass, field
-from umbral import SecretKey, PublicKey, Signer, generate_kfrags
+from umbral_pre import (
+    SecretKey,
+    PublicKey,
+    Signer,
+    generate_kfrags,
+    Capsule,
+    CapsuleFrag,
+    decrypt_original,
+    decrypt_reencrypted,
+    encrypt,
+)
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
@@ -140,7 +150,7 @@ class EnclaveServer:
             "requester": "0x..."
         }
 
-        Returns: Serialized KeyFrag bytes
+        Returns: Serialized VerifiedKeyFrag bytes
         """
         owner = (request.get("owner") or "").lower()
         requester = (request.get("requester") or "").lower()
@@ -148,41 +158,35 @@ class EnclaveServer:
 
         if not owner or not requester:
             return self._error_response("Missing owner or requester address")
-
-        # Get owner's keys
-        owner_keys = self.key_store.get_user_keys(owner)
-        if not owner_keys:
-            return self._error_response(f"Owner {owner} not registered")
-
-        # Get requester's public key
-        requester_keys = self.key_store.get_user_keys(requester)
-        if not requester_keys:
-            return self._error_response(f"Requester {requester} not registered")
-
         try:
-            # Create signer from owner's signing key
+            # NOTE: Redis is not available in the enclave. This is a placeholder, a is simulated here
+            # TODO: implement a secure external cache or a simulated cache for local testing
+
+            owner_keys = self.key_store.get_user_keys(owner.lower())
+            requester_keys = self.key_store.get_user_keys(requester.lower())
+
+            if not owner_keys or not requester_keys:
+                return self._error_response("Owner or requester not registered")
+
             signer = Signer(owner_keys.signing_key)
 
-            # Generate key fragments for re-encryption
-            # This creates kfrags that allow re-encryption from owner to requester
             kfrags = generate_kfrags(
                 delegating_sk=owner_keys.secret_key,
                 receiving_pk=requester_keys.public_key,
                 signer=signer,
                 threshold=THRESHOLD,
                 shares=NUM_KFRAGS,
+                sign_delegating_key=True,
+                sign_receiving_key=True,
             )
 
-            # Return the first kfrag (in production, you might distribute multiple)
-            # The kfrag is already verified since we just generated it
-            kfrag = kfrags[0]
+            kfrag_bytes = bytes(kfrags[0])
 
-            return self._success_response(bytes(kfrag))
+            return self._success_response(kfrag_bytes)
 
         except Exception as e:
-            return self._error_response(
-                f"Failed to generate re-encryption key: {str(e)}"
-            )
+            print(f"Error generating RK: {e}")
+            return self._error_response(f"Failed to generate RK: {str(e)}")
 
     async def handle_get_public_key(self, request: dict) -> bytes:
         """
@@ -205,7 +209,7 @@ class EnclaveServer:
         if not user_keys:
             return self._error_response(f"User {address} not registered")
 
-        return self._success_response(bytes(user_keys.public_key))
+        return self._success_response(user_keys.public_key.to_compressed_bytes())
 
     async def handle_register(self, request: dict) -> bytes:
         """
@@ -230,9 +234,9 @@ class EnclaveServer:
             existing_keys = self.key_store.get_user_keys(address)
             if existing_keys:
                 return self._success_response(
-                    bytes(existing_keys.public_key),
+                    existing_keys.public_key.to_compressed_bytes(),
                     metadata={
-                        "verifying_key": bytes(existing_keys.verifying_key).hex()
+                        "verifying_key": existing_keys.verifying_key.to_compressed_bytes().hex()
                     },
                 )
 
@@ -256,8 +260,8 @@ class EnclaveServer:
 
             response = {
                 "status": "success",
-                "public_key": bytes(public_key).hex(),
-                "verifying_key": bytes(verifying_key).hex(),
+                "public_key": public_key.to_compressed_bytes().hex(),
+                "verifying_key": verifying_key.to_compressed_bytes().hex(),
             }
             return json.dumps(response).encode("utf-8")
 
@@ -335,8 +339,6 @@ class EnclaveServer:
 
         Returns: Decrypted plaintext (the AES key)
         """
-        from umbral import Capsule, CapsuleFrag, decrypt_original, decrypt_reencrypted
-
         address = (request.get("address") or "").lower()
         capsule_hex = request.get("capsule", "")
         ciphertext_hex = request.get("ciphertext", "")
@@ -391,8 +393,6 @@ class EnclaveServer:
             ciphertext = bytes.fromhex(ciphertext_hex)
 
             if is_reencrypted:
-                # This is a re-encrypted scenario using cfrags
-                # We need the owner's public key to decrypt
                 if not owner:
                     return self._error_response(
                         "Owner address required for re-encrypted capsule"
@@ -430,7 +430,6 @@ class EnclaveServer:
                 )
             else:
                 # Direct decryption (owner decrypting their own file)
-                # Decrypt using own secret key
                 plaintext = decrypt_original(
                     delegating_sk=user_keys.secret_key,
                     capsule=capsule,
