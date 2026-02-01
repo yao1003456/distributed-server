@@ -111,29 +111,31 @@ async def get_public_key(redis, address: str) -> bytes | None:
 
 def parse_enclave_response(response: bytes | None) -> bytes | None:
     """
-    Parse enclave response which may be:
-    - Raw bytes (for binary data like keys, kfrags)
-    - JSON with status and data fields
-    - JSON error response
+    Parse enclave response which is always JSON with hex-encoded data.
+
+    Expected format:
+    - Success: {"status": "success", "data": "hex..."}
+    - Error: {"status": "error", "message": "..."}
     """
     if response is None:
         return None
 
-    # Try to parse as JSON first
     try:
         data = json.loads(response.decode("utf-8"))
-        if isinstance(data, dict):
-            if data.get("status") == "error":
-                print(f"Enclave error: {data.get('message')}")
-                return None
-            if "data" in data:
-                # Data is hex-encoded
-                return bytes.fromhex(data["data"])
-        # If JSON but not our expected format, return as-is
-        return response
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        # Not JSON, return raw bytes
-        return response
+        if not isinstance(data, dict):
+            print(f"Enclave response is not a dict: {data}")
+            return None
+        if data.get("status") == "error":
+            print(f"Enclave error: {data.get('message')}")
+            return None
+        if "data" in data:
+            # Data is hex-encoded
+            return bytes.fromhex(data["data"])
+        print(f"Enclave response missing 'data' field: {data}")
+        return None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"Failed to parse enclave response as JSON: {e}")
+        return None
 
 
 # uses rk to re-encrypt capsule from owner to requester
@@ -196,6 +198,10 @@ async def event_listener():
                     from_block=latest_block + 1, to_block=current_block
                 )
 
+                access_revoked_events = await contract.events.accessRevoked.get_logs(
+                    from_block=latest_block + 1, to_block=current_block
+                )
+
                 # Handle AccessGranted events
                 for event in access_granted_events:
                     cid = event["args"]["cid"]
@@ -235,6 +241,22 @@ async def event_listener():
 
                 # Handle AccessDenied events
                 for event in access_denied_events:
+                    owner = event["args"]["owner"]
+                    requester = event["args"]["requester"]
+
+                    # remove rk from redis
+                    rk_key = f"rk:{owner.lower()}:{requester.lower()}"
+                    deleted = await redis.delete(rk_key)
+
+                    if deleted:
+                        print(f"Removed RK for owner={owner}, requester={requester}")
+                    else:
+                        print(
+                            f"No RK found to remove for owner={owner}, requester={requester}"
+                        )
+
+                # Handle AccessRevoked events
+                for event in access_revoked_events:
                     owner = event["args"]["owner"]
                     requester = event["args"]["requester"]
 
@@ -339,6 +361,7 @@ async def lifespan(_: FastAPI):
         await redis_pool.close()
 
 
+# -------------- server API and routes ----------------- 
 app = FastAPI(lifespan=lifespan)
 
 allowed_origins = [
@@ -442,15 +465,16 @@ async def verify_siwe(request: Request):
 
         try:
             data = json.loads(response.decode("utf-8"))
+            if data.get("status") == "error":
+                return {"status": "error", "message": data.get("message")}
             return {
                 "status": "success",
-                "pk": data.get("public_key"),
+                "pk": data.get("public_key") or data.get("data"),
                 "verifying_key": data.get("verifying_key"),
                 "address": address,
             }
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            # Raw bytes response - encode as hex
-            return {"status": "success", "pk": response.hex(), "address": address}
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
 
     except Exception as e:
         return {"status": "error", "message": f"Verification failed: {str(e)}"}
@@ -497,7 +521,6 @@ async def decrypt_capsule(request: Request):
             print(f"[EC2] Fetching ciphertext from blockchain for {cid}")
             file_data = await fetch_file_blockchain(cid)
             # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
-            # Index 3 is ciphertext bytes
             ciphertext_bytes = file_data[3]
             ciphertext_hex = ciphertext_bytes.hex()
         except Exception as e:
@@ -516,9 +539,10 @@ async def decrypt_capsule(request: Request):
                 "action": "decrypt_capsule",
                 "address": address,
                 "capsule": capsule_hex,
-                "ciphertext": ciphertext_hex,  # Pass ciphertext to enclave
+                "ciphertext": ciphertext_hex, 
                 "cid": cid,
                 "is_reencrypted": is_reencrypted,
+                "cfrag": body.get("cfrag", ""),  
                 "owner": owner_address or "",
                 "signature": body.get("signature"),
                 "message": body.get("message"),
@@ -531,10 +555,12 @@ async def decrypt_capsule(request: Request):
 
         try:
             data = json.loads(response.decode("utf-8"))
-            return data
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            # Raw bytes = decrypted AES key
-            return {"status": "success", "aes_key": response.hex()}
+            if data.get("status") == "error":
+                return data
+            # Extract hex-encoded AES key from 'data' field
+            return {"status": "success", "aes_key": data.get("data")}
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
 
     except Exception as e:
         return {"status": "error", "message": f"Decryption failed: {str(e)}"}
@@ -568,11 +594,8 @@ async def login(request: Request):
         try:
             data = json.loads(response.decode("utf-8"))
             return data
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {
-                "status": "success",
-                "data": base64.b64encode(response).decode("ascii"),
-            }
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
     else:
         return {"status": "error", "message": "Failed to communicate with enclave"}
 
@@ -642,8 +665,8 @@ async def get_capsule(cid: str, requester: str, owner: str):
         "cid": cid,
         "owner": owner,
         "requester": requester,
-        "reenc_capsule": base64.b64encode(reenc_capsule).decode("ascii"),
-        "original_capsule": capsule.hex(),  # Include original capsule for decryption
+        "cfrag": reenc_capsule.hex(), 
+        "original_capsule": capsule.hex(),  
     }
 
 
@@ -670,9 +693,6 @@ async def register(request: Request):
         try:
             data = json.loads(response.decode("utf-8"))
             return data
-        except:
-            return {
-                "status": "success",
-                "public_key": base64.b64encode(response).decode("ascii"),
-            }
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
     return {"status": "error", "message": "failed to register user"}

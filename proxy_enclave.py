@@ -456,16 +456,13 @@ class EnclaveServer:
         """
         Create a success response.
 
-        For binary data (keys, kfrags), we return raw bytes.
-        The EC2 proxy knows to handle this based on the action.
+        Always returns JSON with hex-encoded data for consistency.
+        This eliminates parsing ambiguity in the EC2 proxy.
         """
+        response = {"status": "success", "data": data.hex()}
         if metadata:
-            # If there's metadata, wrap in JSON
-            response = {"status": "success", "data": data.hex(), **metadata}
-            return json.dumps(response).encode("utf-8")
-        else:
-            # Return raw bytes for efficiency
-            return data
+            response.update(metadata)
+        return json.dumps(response).encode("utf-8")
 
     def _verify_signature(
         self, address: str, message_text: str, signature: str
