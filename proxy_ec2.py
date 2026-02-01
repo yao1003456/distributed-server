@@ -361,7 +361,7 @@ async def lifespan(_: FastAPI):
         await redis_pool.close()
 
 
-# -------------- server API and routes ----------------- 
+# -------------- server API and routes -----------------
 app = FastAPI(lifespan=lifespan)
 
 allowed_origins = [
@@ -474,7 +474,10 @@ async def verify_siwe(request: Request):
                 "address": address,
             }
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
+            return {
+                "status": "error",
+                "message": f"Failed to parse enclave response: {e}",
+            }
 
     except Exception as e:
         return {"status": "error", "message": f"Verification failed: {str(e)}"}
@@ -539,10 +542,10 @@ async def decrypt_capsule(request: Request):
                 "action": "decrypt_capsule",
                 "address": address,
                 "capsule": capsule_hex,
-                "ciphertext": ciphertext_hex, 
+                "ciphertext": ciphertext_hex,
                 "cid": cid,
                 "is_reencrypted": is_reencrypted,
-                "cfrag": body.get("cfrag", ""),  
+                "cfrag": body.get("cfrag", ""),
                 "owner": owner_address or "",
                 "signature": body.get("signature"),
                 "message": body.get("message"),
@@ -560,7 +563,10 @@ async def decrypt_capsule(request: Request):
             # Extract hex-encoded AES key from 'data' field
             return {"status": "success", "aes_key": data.get("data")}
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
+            return {
+                "status": "error",
+                "message": f"Failed to parse enclave response: {e}",
+            }
 
     except Exception as e:
         return {"status": "error", "message": f"Decryption failed: {str(e)}"}
@@ -595,7 +601,10 @@ async def login(request: Request):
             data = json.loads(response.decode("utf-8"))
             return data
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
+            return {
+                "status": "error",
+                "message": f"Failed to parse enclave response: {e}",
+            }
     else:
         return {"status": "error", "message": "Failed to communicate with enclave"}
 
@@ -665,34 +674,6 @@ async def get_capsule(cid: str, requester: str, owner: str):
         "cid": cid,
         "owner": owner,
         "requester": requester,
-        "cfrag": reenc_capsule.hex(), 
-        "original_capsule": capsule.hex(),  
+        "cfrag": reenc_capsule.hex(),
+        "original_capsule": capsule.hex(),
     }
-
-
-@app.post("/register")
-async def register(request: Request):
-    """Register a new user in the enclave."""
-    try:
-        body = await request.json()
-        address = body.get("address")
-        if not address:
-            return {"status": "error", "message": "missing address"}
-    except:
-        return {"status": "error", "message": "invalid request body"}
-
-    payload = json.dumps(
-        {
-            "action": "register",
-            "address": address,
-        }
-    ).encode()
-
-    response = await forward_enclave(payload)
-    if response:
-        try:
-            data = json.loads(response.decode("utf-8"))
-            return data
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "error", "message": f"Failed to parse enclave response: {e}"}
-    return {"status": "error", "message": "failed to register user"}
