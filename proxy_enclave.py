@@ -104,13 +104,23 @@ class EnclaveServer:
         self.key_store = SecureKeyStore()
         self.is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
 
+    async def log_key_store_periodically(self, interval_seconds: int = 5) -> None:
+        """Log stored user addresses every N seconds (no secrets)."""
+        while True:
+            try:
+                users = list(self.key_store.user_keys.keys())
+                print(f"[ENCLAVE] KeyStore users ({len(users)}): {users}")
+            except Exception as e:
+                print(f"[ENCLAVE] KeyStore log error: {e}")
+            await asyncio.sleep(interval_seconds)
+
     async def handle_request(self, data: bytes) -> bytes:
         """
         Route incoming requests to appropriate handlers.
 
         Expected JSON format:
         {
-            "action": "get_rk" | "get_public_key" | "register" | "login",
+            "action": "get_rk" | "get_public_key" | "login",
             ...action-specific fields
         }
         """
@@ -123,8 +133,6 @@ class EnclaveServer:
                 return await self.handle_get_rk(request)
             elif action == "get_public_key":
                 return await self.handle_get_public_key(request)
-            elif action == "register":
-                return await self.handle_register(request)
             elif action == "login":
                 return await self.handle_login(request)
             elif action == "get_proxy_public_key":
@@ -190,7 +198,7 @@ class EnclaveServer:
 
     async def handle_get_public_key(self, request: dict) -> bytes:
         """
-        Retrieve a user's public key.
+        Retrieve a user's public key and verifying key.
 
         Request format:
         {
@@ -198,7 +206,7 @@ class EnclaveServer:
             "address": "0x..."
         }
 
-        Returns: Serialized PublicKey bytes
+        Returns: JSON with public_key and verifying_key (hex-encoded)
         """
         address = request.get("address", "").lower()
 
@@ -209,7 +217,12 @@ class EnclaveServer:
         if not user_keys:
             return self._error_response(f"User {address} not registered")
 
-        return self._success_response(user_keys.public_key.to_compressed_bytes())
+        response = {
+            "status": "success",
+            "public_key": user_keys.public_key.to_compressed_bytes().hex(),
+            "verifying_key": user_keys.verifying_key.to_compressed_bytes().hex(),
+        }
+        return json.dumps(response).encode("utf-8")
 
     async def handle_register(self, request: dict) -> bytes:
         """
@@ -218,8 +231,7 @@ class EnclaveServer:
         Request format:
         {
             "action": "register",
-            "address": "0x...",
-            "signature": "0x..." (optional - for verification)
+            "address": "0x...", (wallet address)
         }
 
         Returns: User's public key bytes
@@ -229,16 +241,6 @@ class EnclaveServer:
 
         if not address:
             return self._error_response("Missing address")
-
-        if self.key_store.has_user(address):
-            existing_keys = self.key_store.get_user_keys(address)
-            if existing_keys:
-                return self._success_response(
-                    existing_keys.public_key.to_compressed_bytes(),
-                    metadata={
-                        "verifying_key": existing_keys.verifying_key.to_compressed_bytes().hex()
-                    },
-                )
 
         try:
             # Generate new key pair for user
@@ -260,6 +262,7 @@ class EnclaveServer:
 
             response = {
                 "status": "success",
+                "address": address,
                 "public_key": public_key.to_compressed_bytes().hex(),
                 "verifying_key": verifying_key.to_compressed_bytes().hex(),
             }
@@ -275,13 +278,10 @@ class EnclaveServer:
         Request format:
         {
             "action": "login",
-            "address": "0x...",
-            "signature": "0x...",
-            "message": "..."
+            "address": "0x..."(wallet address),
+            "signature": "0x..."(wallet signature of message),
+            "message": "..."(message signed by wallet)
         }
-
-        In production, this would verify the signature against the user's
-        Ethereum address to prove ownership.
         """
         address = request.get("address", "").lower()
         signature = request.get("signature", "")
@@ -295,24 +295,22 @@ class EnclaveServer:
         if not self._verify_signature(address, message, signature):
             return self._error_response("Invalid signature")
 
+        # create user if not exists, else return user keys
         if not self.key_store.has_user(address):
-            # Auto-register on first login
             return await self.handle_register(request)
 
         user_keys = self.key_store.get_user_keys(address)
-        if user_keys is None:
-            # Should not happen since we check has_user above, but handle anyway
-            return await self.handle_register(request)
 
-        # TODO: Generate a session token (in production, use proper JWT or similar)
-        session_token = secrets.token_hex(32)
+        if user_keys is None:
+            return self._error_response("User keys not found")
+
+        # NOTE: maybe implement session token if theres time
 
         response_data = {
             "status": "success",
             "address": address,
             "public_key": bytes(user_keys.public_key).hex(),
             "verifying_key": bytes(user_keys.verifying_key).hex(),
-            "session_token": session_token,
         }
 
         print(f"[ENCLAVE] Login successful for {address}")
@@ -335,6 +333,8 @@ class EnclaveServer:
             "is_reencrypted": false,  # True if using re-encrypted cfrags
             "cfrag": "hex...",  # Required if is_reencrypted=true - the CapsuleFrag
             "owner": "0x..."  # Required if is_reencrypted=true
+            "signature": "0x..." (wallet signature of message)
+            "message": "..." (message signed by wallet)
         }
 
         Returns: Decrypted plaintext (the AES key)
@@ -583,6 +583,9 @@ async def main():
 
     # Initialize the enclave server
     enclave_server = EnclaveServer()
+
+    # Start periodic key store logging
+    asyncio.create_task(enclave_server.log_key_store_periodically(5))
 
     # Start the VSOCK server
     vsock_server = VSockServer(enclave_server)

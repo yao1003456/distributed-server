@@ -86,12 +86,22 @@ async def get_rk(redis, owner: str, requester: str):
     return rk
 
 
-async def get_public_key(redis, address: str) -> bytes | None:
-    """Get user's public key from cache or enclave."""
+async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | None]:
+    """Get user's public key and verifying key from cache or enclave.
+    
+    Returns:
+        Tuple of (public_key_bytes, verifying_key_bytes) or (None, None) on failure
+    """
     pk_key = f"pk:{address.lower()}"
+    vk_key = f"vk:{address.lower()}"
+    
     pk = await redis.get(pk_key)
-    if pk:
-        return pk
+    vk = await redis.get(vk_key)
+    
+    if pk and vk:
+        print(f"[EC2] PK/VK found in cache for {address}")
+        return pk, vk
+    print(f"[EC2] PK/VK not in cache for {address}, requesting from enclave...")
 
     payload = json.dumps(
         {
@@ -101,12 +111,30 @@ async def get_public_key(redis, address: str) -> bytes | None:
     ).encode()
 
     response = await forward_enclave(payload)
-    pk = parse_enclave_response(response)
+    if response is None:
+        return None, None
 
-    if pk:
-        # Cache public keys longer since they don't change
-        await redis.set(pk_key, pk, ex=RK_TTL_SECONDS * 24)
-    return pk
+    try:
+        data = json.loads(response.decode("utf-8"))
+        if data.get("status") == "error":
+            print(f"Enclave error: {data.get('message')}")
+            return None, None
+        
+        pk_hex = data.get("public_key")
+        vk_hex = data.get("verifying_key")
+        
+        if pk_hex and vk_hex:
+            pk = bytes.fromhex(pk_hex)
+            vk = bytes.fromhex(vk_hex)
+            # Cache both keys (they don't change)
+            await redis.set(pk_key, pk, ex=RK_TTL_SECONDS * 24)
+            await redis.set(vk_key, vk, ex=RK_TTL_SECONDS * 24)
+            print(f"[EC2] PK/VK cached for {address}")
+            return pk, vk
+        return None, None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"Failed to parse enclave response: {e}")
+        return None, None
 
 
 def parse_enclave_response(response: bytes | None) -> bytes | None:
@@ -143,6 +171,7 @@ async def reencrypt_capsule(
     rk_bytes: bytes,
     capsule_bytes: bytes,
     owner_pk_bytes: bytes,
+    owner_vk_bytes: bytes,
     requester_pk_bytes: bytes,
 ) -> bytes:
     """
@@ -151,8 +180,9 @@ async def reencrypt_capsule(
     Args:
         rk_bytes: Serialized KeyFrag from enclave
         capsule_bytes: Serialized Capsule
-        owner_pk_bytes: Owner's public key bytes (for kfrag verification)
-        requester_pk_bytes: Requester's public key bytes (for kfrag verification)
+        owner_pk_bytes: Owner's encryption public key bytes (delegating_pk)
+        owner_vk_bytes: Owner's verifying key bytes (for kfrag signature verification)
+        requester_pk_bytes: Requester's public key bytes (receiving_pk)
 
     Returns:
         Serialized CapsuleFrag
@@ -161,11 +191,12 @@ async def reencrypt_capsule(
         capsule = Capsule.from_bytes(capsule_bytes)
 
         owner_pk = PublicKey.from_compressed_bytes(owner_pk_bytes)
+        owner_vk = PublicKey.from_compressed_bytes(owner_vk_bytes)
         requester_pk = PublicKey.from_compressed_bytes(requester_pk_bytes)
 
         kfrag = KeyFrag.from_bytes(rk_bytes)
         verified_kfrag = kfrag.verify(
-            verifying_pk=owner_pk, delegating_pk=owner_pk, receiving_pk=requester_pk
+            verifying_pk=owner_vk, delegating_pk=owner_pk, receiving_pk=requester_pk
         )
 
         cfrag = reencrypt(capsule=capsule, kfrag=verified_kfrag)
@@ -397,6 +428,7 @@ async def get_nonce():
 
     nonce = secrets.token_hex(16)
     nonce_store[nonce] = time.time()
+    print(f"[EC2] Nonce issued. Active nonces: {len(nonce_store)}")
 
     # Clean up expired nonces
     current_time = time.time()
@@ -405,6 +437,8 @@ async def get_nonce():
     ]
     for k in expired:
         del nonce_store[k]
+    if expired:
+        print(f"[EC2] Cleaned up {len(expired)} expired nonces")
 
     return {"nonce": nonce}
 
@@ -433,15 +467,18 @@ async def verify_siwe(request: Request):
         # Verify nonce exists and hasn't expired
         nonce = siwe_message.nonce
         if nonce not in nonce_store:
+            print("[EC2] SIWE nonce missing or expired")
             return {"status": "error", "message": "Invalid or expired nonce"}
 
         if time.time() - nonce_store[nonce] > NONCE_EXPIRY_SECONDS:
             del nonce_store[nonce]
+            print("[EC2] SIWE nonce expired")
             return {"status": "error", "message": "Nonce expired"}
 
         # Verify signature
         print(f"[EC2] Verifying SIWE for {siwe_message.address}")
         siwe_message.verify(signature)
+        print("[EC2] SIWE signature verified")
 
         # Remove used nonce
         del nonce_store[nonce]
@@ -457,7 +494,7 @@ async def verify_siwe(request: Request):
                 "signature": signature,
                 "message": message_str,
             }
-        ).encode()
+        ).encode("utf-8")
 
         response = await forward_enclave(payload)
         if not response:
@@ -467,11 +504,12 @@ async def verify_siwe(request: Request):
             data = json.loads(response.decode("utf-8"))
             if data.get("status") == "error":
                 return {"status": "error", "message": data.get("message")}
+            print("[EC2] Enclave login successful")
             return {
                 "status": "success",
                 "pk": data.get("public_key") or data.get("data"),
                 "verifying_key": data.get("verifying_key"),
-                "address": address,
+                "address": data.get("address"),
             }
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return {
@@ -511,6 +549,7 @@ async def decrypt_capsule(request: Request):
                 status = await contract.functions.getAccessStatus(cid, address).call()
                 # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
                 if status != 2:
+                    print(f"[EC2] Access not approved for {address} on {cid}")
                     return {
                         "status": "error",
                         "message": "Access not approved on-chain",
@@ -526,6 +565,7 @@ async def decrypt_capsule(request: Request):
             # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
             ciphertext_bytes = file_data[3]
             ciphertext_hex = ciphertext_bytes.hex()
+            print(f"[EC2] Ciphertext length: {len(ciphertext_hex)}")
         except Exception as e:
             print(f"[EC2] Failed to fetch ciphertext from chain: {e}")
             return {
@@ -537,6 +577,7 @@ async def decrypt_capsule(request: Request):
             return {"status": "error", "message": "Ciphertext not found on-chain"}
 
         # Forward to enclave for decryption
+        print("[EC2] Forwarding decrypt request to enclave")
         payload = json.dumps(
             {
                 "action": "decrypt_capsule",
@@ -561,6 +602,7 @@ async def decrypt_capsule(request: Request):
             if data.get("status") == "error":
                 return data
             # Extract hex-encoded AES key from 'data' field
+            print("[EC2] Decrypt successful, returning AES key")
             return {"status": "success", "aes_key": data.get("data")}
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return {
@@ -570,43 +612,6 @@ async def decrypt_capsule(request: Request):
 
     except Exception as e:
         return {"status": "error", "message": f"Decryption failed: {str(e)}"}
-
-
-@app.post("/login")
-async def login(request: Request):
-    """Handle user login via enclave."""
-    try:
-        body = await request.json()
-        address = body.get("address")
-        signature = body.get("signature", "")
-        message = body.get("message", "")
-
-        if not address:
-            return {"status": "error", "message": "missing address"}
-    except:
-        return {"status": "error", "message": "invalid request body"}
-
-    payload = json.dumps(
-        {
-            "action": "login",
-            "address": address,
-            "signature": signature,
-            "message": message,
-        }
-    ).encode()
-
-    response = await forward_enclave(payload)
-    if response:
-        try:
-            data = json.loads(response.decode("utf-8"))
-            return data
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {
-                "status": "error",
-                "message": f"Failed to parse enclave response: {e}",
-            }
-    else:
-        return {"status": "error", "message": "Failed to communicate with enclave"}
 
 
 @app.get("/api/capsule/{cid}")
@@ -621,6 +626,7 @@ async def get_capsule(cid: str, requester: str, owner: str):
         status = await contract.functions.getAccessStatus(cid, requester).call()
         # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
         if status != 2:
+            print(f"[EC2] Access not approved for {requester} on {cid}")
             return {"status": "error", "message": "Access not approved on-chain"}
     except Exception as e:
         return {"status": "error", "message": f"Access verification failed: {e}"}
@@ -638,6 +644,7 @@ async def get_capsule(cid: str, requester: str, owner: str):
         else:
             # It might be returned as a hex string with 0x prefix
             capsule = bytes(capsule)
+        print(f"[EC2] Chain owner: {chain_owner}")
     except Exception as e:
         return {"status": "error", "message": f"chain fetch failed: {e}"}
 
@@ -648,24 +655,28 @@ async def get_capsule(cid: str, requester: str, owner: str):
     rk = await get_rk(redis, owner, requester)
     if not rk:
         return {"status": "error", "message": "could not obtain re-encryption key"}
+    print(f"[EC2] RK retrieved for {owner}->{requester}")
 
-    # Get public keys for kfrag verification
-    owner_pk_bytes = await get_public_key(redis, owner)
-    requester_pk_bytes = await get_public_key(redis, requester)
+    # Get public keys and verifying keys for kfrag verification
+    owner_pk_bytes, owner_vk_bytes = await get_public_key(redis, owner)
+    requester_pk_bytes, _ = await get_public_key(redis, requester)
 
-    if not owner_pk_bytes:
+    if not owner_pk_bytes or not owner_vk_bytes:
         return {"status": "error", "message": "owner not registered in enclave"}
     if not requester_pk_bytes:
         return {"status": "error", "message": "requester not registered in enclave"}
 
     # Perform re-encryption
     try:
+        print("[EC2] Re-encrypting capsule...")
         reenc_capsule = await reencrypt_capsule(
             rk_bytes=rk,
             capsule_bytes=capsule,
             owner_pk_bytes=owner_pk_bytes,
+            owner_vk_bytes=owner_vk_bytes,
             requester_pk_bytes=requester_pk_bytes,
         )
+        print("[EC2] Re-encryption successful")
     except Exception as e:
         return {"status": "error", "message": f"reencryption failed: {e}"}
 
