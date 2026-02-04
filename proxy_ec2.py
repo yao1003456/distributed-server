@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import asynccontextmanager
 from web3 import AsyncWeb3, Web3
 from siwe import SiweMessage
-from socket_utils import get_socket_type, get_connection_address
 from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
 from dotenv import load_dotenv
@@ -88,16 +87,16 @@ async def get_rk(redis, owner: str, requester: str):
 
 async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | None]:
     """Get user's public key and verifying key from cache or enclave.
-    
+
     Returns:
         Tuple of (public_key_bytes, verifying_key_bytes) or (None, None) on failure
     """
     pk_key = f"pk:{address.lower()}"
     vk_key = f"vk:{address.lower()}"
-    
+
     pk = await redis.get(pk_key)
     vk = await redis.get(vk_key)
-    
+
     if pk and vk:
         print(f"[EC2] PK/VK found in cache for {address}")
         return pk, vk
@@ -119,10 +118,10 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
         if data.get("status") == "error":
             print(f"Enclave error: {data.get('message')}")
             return None, None
-        
+
         pk_hex = data.get("public_key")
         vk_hex = data.get("verifying_key")
-        
+
         if pk_hex and vk_hex:
             pk = bytes.fromhex(pk_hex)
             vk = bytes.fromhex(vk_hex)
@@ -239,35 +238,13 @@ async def event_listener():
                     owner = event["args"]["owner"]
                     requester = event["args"]["requester"]
 
-                    # check redis cache for existing rk
-                    rk_key = f"rk:{owner.lower()}:{requester.lower()}"
-                    existing_rk = await redis.get(rk_key)
-
-                    if not existing_rk:
-                        # ping enclave for rk
-                        payload = json.dumps(
-                            {
-                                "action": "get_rk",
-                                "owner": owner,
-                                "requester": requester,
-                            }
-                        ).encode()
-                        response = await forward_enclave(payload)
-                        rk = parse_enclave_response(response)
-
-                        if rk:
-                            # store rk in redis with expiration
-                            await redis.set(rk_key, rk, ex=RK_TTL_SECONDS)
-                            print(
-                                f"Cached RK for owner={owner}, requester={requester}, cid={cid}"
-                            )
-                        else:
-                            print(
-                                f"Failed to obtain RK for owner={owner}, requester={requester}"
-                            )
+                    # fetch/cache usage of rk using helper function
+                    rk = await get_rk(redis, owner, requester)
+                    if rk:
+                        print(f"RK ensured for owner={owner}, requester={requester}")
                     else:
                         print(
-                            f"RK already cached for owner={owner}, requester={requester}"
+                            f"Failed to obtain RK for owner={owner}, requester={requester}"
                         )
 
                 # Handle AccessDenied events
@@ -537,7 +514,10 @@ async def decrypt_capsule(request: Request):
         capsule_hex = body.get("capsule")  # Original or re-encrypted capsule
         cid = body.get("cid")
         is_reencrypted = body.get("is_reencrypted", False)
-        owner_address = body.get("owner")  # Required for re-encrypted capsules
+        owner_address = body.get("owner", "")  # Required for re-encrypted capsules
+        signature = body.get("signature")
+        message = body.get("message")
+        cfrag = body.get("cfrag", "")
 
         if not address or not capsule_hex:
             return {"status": "error", "message": "Missing address or capsule"}
@@ -586,10 +566,10 @@ async def decrypt_capsule(request: Request):
                 "ciphertext": ciphertext_hex,
                 "cid": cid,
                 "is_reencrypted": is_reencrypted,
-                "cfrag": body.get("cfrag", ""),
-                "owner": owner_address or "",
-                "signature": body.get("signature"),
-                "message": body.get("message"),
+                "cfrag": cfrag,
+                "owner": owner_address,
+                "signature": signature,
+                "message": message,
             }
         ).encode()
 
@@ -637,6 +617,7 @@ async def get_capsule(cid: str, requester: str, owner: str):
         chain_owner = file_data[0]
         capsule = file_data[2]  # Now bytes from contract
         # Convert bytes to proper format if needed
+        # TODO: Check if this is needed, and ensure consistent return type from contract
         if isinstance(capsule, str):
             capsule = bytes.fromhex(capsule.replace("0x", ""))
         elif isinstance(capsule, bytes):

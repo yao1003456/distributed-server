@@ -309,8 +309,8 @@ class EnclaveServer:
         response_data = {
             "status": "success",
             "address": address,
-            "public_key": bytes(user_keys.public_key).hex(),
-            "verifying_key": bytes(user_keys.verifying_key).hex(),
+            "public_key": user_keys.public_key.to_compressed_bytes().hex(),
+            "verifying_key": user_keys.verifying_key.to_compressed_bytes().hex(),
         }
 
         print(f"[ENCLAVE] Login successful for {address}")
@@ -448,8 +448,10 @@ class EnclaveServer:
         Return the proxy's public key for attestation verification.
         """
         return self._success_response(
-            bytes(self.key_store.proxy_public_key),
-            metadata={"verifying_key": bytes(self.key_store.proxy_verifying_key).hex()},
+            self.key_store.proxy_public_key.to_compressed_bytes(),
+            metadata={
+                "verifying_key": self.key_store.proxy_verifying_key.to_compressed_bytes().hex()
+            },
         )
 
     def _success_response(self, data: bytes, metadata: Optional[dict] = None) -> bytes:
