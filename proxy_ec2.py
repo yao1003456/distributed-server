@@ -266,7 +266,7 @@ async def event_listener():
                 # Handle AccessRevoked events
                 for event in access_revoked_events:
                     owner = event["args"]["owner"]
-                    requester = event["args"]["requester"]
+                    requester = event["args"]["user"]
 
                     # remove rk from redis
                     rk_key = f"rk:{owner.lower()}:{requester.lower()}"
