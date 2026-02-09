@@ -104,16 +104,6 @@ class EnclaveServer:
         self.key_store = SecureKeyStore()
         self.is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
 
-    async def log_key_store_periodically(self, interval_seconds: int = 5) -> None:
-        """Log stored user addresses every N seconds (no secrets)."""
-        while True:
-            try:
-                users = list(self.key_store.user_keys.keys())
-                print(f"[ENCLAVE] KeyStore users ({len(users)}): {users}")
-            except Exception as e:
-                print(f"[ENCLAVE] KeyStore log error: {e}")
-            await asyncio.sleep(interval_seconds)
-
     async def handle_request(self, data: bytes) -> bytes:
         """
         Route incoming requests to appropriate handlers.
@@ -585,9 +575,6 @@ async def main():
 
     # Initialize the enclave server
     enclave_server = EnclaveServer()
-
-    # Start periodic key store logging
-    asyncio.create_task(enclave_server.log_key_store_periodically(5))
 
     # Start the VSOCK server
     vsock_server = VSockServer(enclave_server)

@@ -29,11 +29,13 @@ w3_client = None
 
 # helper functions for blockchain interaction
 async def get_web3():
-    """Get a Web3 instance with WebSocket provider."""
+    """Get a Web3 instance with appropriate provider."""
     global w3_client
     if w3_client is None:
-        # Fallback if accessed before startup for some reason, though shouldn't happen with correct lifecycle
-        w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
+        if RPC_URL.startswith("http"):
+            w3_client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(RPC_URL))
+        else:
+            w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
     return w3_client
 
 
@@ -346,7 +348,12 @@ async def lifespan(_: FastAPI):
     redis_pool = await redis.from_url(REDIS_URL)
 
     # Initialize Web3
-    w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
+    print(f"[EC2] Connecting to RPC: {RPC_URL}")
+    print(f"[EC2] Using Contract Address: {CONTRACT_ADDRESS}")
+    if RPC_URL.startswith("http"):
+        w3_client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(RPC_URL))
+    else:
+        w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
     try:
         await w3_client.provider.connect()
         if await w3_client.is_connected():
@@ -386,7 +393,7 @@ if env_origins:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,  # Vite/React dev servers
+    allow_origins=["*"],  # Vite/React dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
