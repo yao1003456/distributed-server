@@ -152,7 +152,7 @@ def parse_enclave_response(response: bytes | None) -> bytes | None:
     try:
         data = json.loads(response.decode("utf-8"))
         if not isinstance(data, dict):
-            print(f"Enclave response is not a dict: {data}")
+            print("Enclave response is not a valid dictionary.")
             return None
         if data.get("status") == "error":
             print(f"Enclave error: {data.get('message')}")
@@ -160,7 +160,7 @@ def parse_enclave_response(response: bytes | None) -> bytes | None:
         if "data" in data:
             # Data is hex-encoded
             return bytes.fromhex(data["data"])
-        print(f"Enclave response missing 'data' field: {data}")
+        print("Enclave response missing 'data' field.")
         return None
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         print(f"Failed to parse enclave response as JSON: {e}")
