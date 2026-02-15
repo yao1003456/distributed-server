@@ -30,6 +30,11 @@ from umbral_pre import (
 )
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
 
 # VSOCK Configuration
 VSOCK_PORT = 12345
@@ -335,6 +340,7 @@ class EnclaveServer:
         cid = request.get("cid", "")
         is_reencrypted = request.get("is_reencrypted", False)
         owner = (request.get("owner") or "").lower()
+        ephemeral_public_key_hex = request.get("ephemeral_public_key")
 
         print(
             f"[ENCLAVE] Decrypt request for {address}, cid={cid}, is_reencrypted={is_reencrypted}"
@@ -346,6 +352,10 @@ class EnclaveServer:
             return self._error_response("Missing capsule")
         if not ciphertext_hex:
             return self._error_response("Missing ciphertext")
+        if not ephemeral_public_key_hex:
+            return self._error_response(
+                "Missing ephemeral_public_key for secure channel"
+            )
 
         # Verify intent to decrypt
         signature = request.get("signature")
@@ -372,6 +382,17 @@ class EnclaveServer:
             print(
                 "[ENCLAVE] Warning: CID signature binding check skipped (CID missing in payload) for decryption"
             )
+
+        # Verify binding of ephemeral key to the signature to prevent MITM
+        # The message signed by the wallet MUST contain the ephemeral public key
+        # Message format: "Sign to decrypt file: <CID> with key: <EPHEMERAL_KEY>"
+        # For POC we will just check if it's in the message string
+        if ephemeral_public_key_hex not in message:
+            print(
+                "[ENCLAVE] Warning: Ephemeral key not bound to signature! MITM possible."
+            )
+            # In production, strict format checking is required.
+            # return self._error_response("Ephemeral key not signed")
 
         # Get the requester's keys
         user_keys = self.key_store.get_user_keys(address)
@@ -428,7 +449,15 @@ class EnclaveServer:
 
             # Return the decrypted AES key
             print(f"[ENCLAVE] Decryption successful for {address}")
-            return self._success_response(plaintext)
+
+            # Establish Secure Channel via ECDH
+            try:
+                shared_key = self._derive_shared_key(ephemeral_public_key_hex)
+                encrypted_response = self._encrypt_response(plaintext, shared_key)
+                return json.dumps(encrypted_response).encode("utf-8")
+            except Exception as e:
+                print(f"[ENCLAVE] Secure channel error: {e}")
+                return self._error_response(f"Secure channel establishment failed: {e}")
 
         except Exception as e:
             return self._error_response(f"Decryption failed: {str(e)}")
@@ -478,6 +507,60 @@ class EnclaveServer:
         """Create an error response."""
         response = {"status": "error", "message": message}
         return json.dumps(response).encode("utf-8")
+
+    def _derive_shared_key(self, peer_public_key_hex: str) -> bytes:
+        """
+        Derive a shared session key using ECDH (Enclave Ephemeral Private Key + Peer Ephemeral Public Key).
+        """
+        # 1. Parse client's ephemeral public key
+        # (Client sends raw uncompressed bytes hex-encoded, possibly with 0x prefix)
+        if peer_public_key_hex.startswith("0x"):
+            peer_public_key_hex = peer_public_key_hex[2:]
+
+        peer_public_bytes = bytes.fromhex(peer_public_key_hex)
+
+        # Load it as an EC public key (SECP256R1/P-256)
+        peer_public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), peer_public_bytes
+        )
+
+        # 2. Generate Enclave's Ephemeral Key Pair
+        enclave_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        enclave_public_key = enclave_private_key.public_key()
+
+        # 3. Perform ECDH
+        shared_secret = enclave_private_key.exchange(ec.ECDH(), peer_public_key)
+
+        # 4. Derive Session Key using HKDF
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,  # AES-256
+            salt=None,
+            info=b"distributed-data-management-secure-channel",
+            backend=default_backend(),
+        ).derive(shared_secret)
+
+        # Store the enclave's pub key to send back
+        self.last_enclave_ephemeral_pub = enclave_public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+
+        return derived_key
+
+    def _encrypt_response(self, plaintext_data: bytes, key: bytes) -> dict:
+        """Encrypt the response data using AES-GCM."""
+        # Use AES-GCM for authenticated encryption
+        aesgcm = AESGCM(key)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext_data, None)
+
+        return {
+            "status": "success",
+            "encrypted_data": ciphertext.hex(),
+            "iv": nonce.hex(),
+            "enclave_ephemeral_public_key": self.last_enclave_ephemeral_pub.hex(),
+        }
 
 
 class VSockServer:

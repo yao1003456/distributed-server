@@ -3,6 +3,7 @@ import json
 import base64
 import secrets
 import redis.asyncio as redis
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import asynccontextmanager
@@ -11,6 +12,14 @@ from siwe import SiweMessage
 from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
 from dotenv import load_dotenv
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv(".env.local")
 
@@ -63,14 +72,14 @@ async def fetch_file_blockchain(cid: str):
 
 async def get_rk(redis, owner: str, requester: str):
     """Get re-encryption key from cache or enclave."""
-    print(f"[EC2] Fetching RK for {owner}->{requester}")
+    logger.info(f"[EC2] Fetching RK for {owner}->{requester}")
     rk_key = f"rk:{owner.lower()}:{requester.lower()}"
     rk = await redis.get(rk_key)
     if rk:
-        print(f"[EC2] RK found in cache")
+        logger.info(f"[EC2] RK found in cache")
         return rk
 
-    print(f"[EC2] RK not in cache, requesting from enclave...")
+    logger.info(f"[EC2] RK not in cache, requesting from enclave...")
     payload = json.dumps(
         {
             "action": "get_rk",
@@ -100,9 +109,9 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
     vk = await redis.get(vk_key)
 
     if pk and vk:
-        print(f"[EC2] PK/VK found in cache for {address}")
+        logger.info(f"[EC2] PK/VK found in cache for {address}")
         return pk, vk
-    print(f"[EC2] PK/VK not in cache for {address}, requesting from enclave...")
+    logger.info(f"[EC2] PK/VK not in cache for {address}, requesting from enclave...")
 
     payload = json.dumps(
         {
@@ -118,7 +127,7 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
     try:
         data = json.loads(response.decode("utf-8"))
         if data.get("status") == "error":
-            print(f"Enclave error: {data.get('message')}")
+            logger.error(f"Enclave error: {data.get('message')}")
             return None, None
 
         pk_hex = data.get("public_key")
@@ -130,11 +139,11 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
             # Cache both keys (they don't change)
             await redis.set(pk_key, pk, ex=RK_TTL_SECONDS * 24)
             await redis.set(vk_key, vk, ex=RK_TTL_SECONDS * 24)
-            print(f"[EC2] PK/VK cached for {address}")
+            logger.info(f"[EC2] PK/VK cached for {address}")
             return pk, vk
         return None, None
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        print(f"Failed to parse enclave response: {e}")
+        logger.error(f"Failed to parse enclave response: {e}")
         return None, None
 
 
@@ -152,18 +161,18 @@ def parse_enclave_response(response: bytes | None) -> bytes | None:
     try:
         data = json.loads(response.decode("utf-8"))
         if not isinstance(data, dict):
-            print("Enclave response is not a valid dictionary.")
+            logger.error("Enclave response is not a valid dictionary.")
             return None
         if data.get("status") == "error":
-            print(f"Enclave error: {data.get('message')}")
+            logger.error(f"Enclave error: {data.get('message')}")
             return None
         if "data" in data:
             # Data is hex-encoded
             return bytes.fromhex(data["data"])
-        print("Enclave response missing 'data' field.")
+        logger.error("Enclave response missing 'data' field.")
         return None
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        print(f"Failed to parse enclave response as JSON: {e}")
+        logger.error(f"Failed to parse enclave response as JSON: {e}")
         return None
 
 
@@ -243,9 +252,11 @@ async def event_listener():
                     # fetch/cache usage of rk using helper function
                     rk = await get_rk(redis, owner, requester)
                     if rk:
-                        print(f"RK ensured for owner={owner}, requester={requester}")
+                        logger.info(
+                            f"RK ensured for owner={owner}, requester={requester}"
+                        )
                     else:
-                        print(
+                        logger.error(
                             f"Failed to obtain RK for owner={owner}, requester={requester}"
                         )
 
@@ -259,9 +270,11 @@ async def event_listener():
                     deleted = await redis.delete(rk_key)
 
                     if deleted:
-                        print(f"Removed RK for owner={owner}, requester={requester}")
+                        logger.info(
+                            f"Removed RK for owner={owner}, requester={requester}"
+                        )
                     else:
-                        print(
+                        logger.warning(
                             f"No RK found to remove for owner={owner}, requester={requester}"
                         )
 
@@ -275,16 +288,18 @@ async def event_listener():
                     deleted = await redis.delete(rk_key)
 
                     if deleted:
-                        print(f"Removed RK for owner={owner}, requester={requester}")
+                        logger.info(
+                            f"Removed RK for owner={owner}, requester={requester}"
+                        )
                     else:
-                        print(
+                        logger.warning(
                             f"No RK found to remove for owner={owner}, requester={requester}"
                         )
 
                 latest_block = current_block
 
         except Exception as e:
-            print(f"Event listener error: {e}")
+            logger.error(f"Event listener error: {e}")
 
         await asyncio.sleep(5)
 
@@ -316,7 +331,7 @@ async def forward_enclave(payload: bytes) -> bytes | None:
             reader, writer = await asyncio.open_connection(sock=sock)
 
         # Send length-prefixed message for proper framing
-        print(f"[EC2] Forwarding {len(payload)} bytes to enclave")
+        logger.info(f"[EC2] Forwarding {len(payload)} bytes to enclave")
         length_prefix = len(payload).to_bytes(4, "big")
         writer.write(length_prefix + payload)
         await writer.drain()
@@ -327,17 +342,17 @@ async def forward_enclave(payload: bytes) -> bytes | None:
 
         # Read the full response
         data = await reader.readexactly(response_length)
-        print(f"[EC2] Received {len(data)} bytes from enclave")
+        logger.info(f"[EC2] Received {len(data)} bytes from enclave")
 
         writer.close()
         await writer.wait_closed()
         return data
 
     except asyncio.IncompleteReadError as e:
-        print(f"Incomplete read from enclave: {e}")
+        logger.error(f"Incomplete read from enclave: {e}")
         return None
     except Exception as e:
-        print(f"Connection error: {e}")
+        logger.error(f"Connection error: {e}")
         return None
 
 
@@ -348,8 +363,8 @@ async def lifespan(_: FastAPI):
     redis_pool = await redis.from_url(REDIS_URL)
 
     # Initialize Web3
-    print(f"[EC2] Connecting to RPC: {RPC_URL}")
-    print(f"[EC2] Using Contract Address: {CONTRACT_ADDRESS}")
+    logger.info(f"[EC2] Connecting to RPC: {RPC_URL}")
+    logger.info(f"[EC2] Using Contract Address: {CONTRACT_ADDRESS}")
     if RPC_URL.startswith("http"):
         w3_client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(RPC_URL))
     else:
@@ -357,11 +372,11 @@ async def lifespan(_: FastAPI):
     try:
         await w3_client.provider.connect()
         if await w3_client.is_connected():
-            print(f"Connected to Ethereum node at {RPC_URL}")
+            logger.info(f"Connected to Ethereum node at {RPC_URL}")
         else:
-            print(f"Failed to connect to Ethereum node at {RPC_URL}")
+            logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
     except Exception as e:
-        print(f"Error connecting to Ethereum node: {e}")
+        logger.error(f"Error connecting to Ethereum node: {e}")
 
     task = asyncio.create_task(event_listener())
     yield
@@ -412,7 +427,7 @@ async def get_nonce():
 
     nonce = secrets.token_hex(16)
     nonce_store[nonce] = time.time()
-    print(f"[EC2] Nonce issued. Active nonces: {len(nonce_store)}")
+    logger.info(f"[EC2] Nonce issued. Active nonces: {len(nonce_store)}")
 
     # Clean up expired nonces
     current_time = time.time()
@@ -422,7 +437,7 @@ async def get_nonce():
     for k in expired:
         del nonce_store[k]
     if expired:
-        print(f"[EC2] Cleaned up {len(expired)} expired nonces")
+        logger.info(f"[EC2] Cleaned up {len(expired)} expired nonces")
 
     return {"nonce": nonce}
 
@@ -451,18 +466,18 @@ async def verify_siwe(request: Request):
         # Verify nonce exists and hasn't expired
         nonce = siwe_message.nonce
         if nonce not in nonce_store:
-            print("[EC2] SIWE nonce missing or expired")
+            logger.warning("[EC2] SIWE nonce missing or expired")
             return {"status": "error", "message": "Invalid or expired nonce"}
 
         if time.time() - nonce_store[nonce] > NONCE_EXPIRY_SECONDS:
             del nonce_store[nonce]
-            print("[EC2] SIWE nonce expired")
+            logger.warning("[EC2] SIWE nonce expired")
             return {"status": "error", "message": "Nonce expired"}
 
         # Verify signature
-        print(f"[EC2] Verifying SIWE for {siwe_message.address}")
+        logger.info(f"[EC2] Verifying SIWE for {siwe_message.address}")
         siwe_message.verify(signature)
-        print("[EC2] SIWE signature verified")
+        logger.info("[EC2] SIWE signature verified")
 
         # Remove used nonce
         del nonce_store[nonce]
@@ -488,7 +503,7 @@ async def verify_siwe(request: Request):
             data = json.loads(response.decode("utf-8"))
             if data.get("status") == "error":
                 return {"status": "error", "message": data.get("message")}
-            print("[EC2] Enclave login successful")
+            logger.info("[EC2] Enclave login successful")
             return {
                 "status": "success",
                 "pk": data.get("public_key") or data.get("data"),
@@ -496,13 +511,15 @@ async def verify_siwe(request: Request):
                 "address": data.get("address"),
             }
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Failed to parse enclave response: {e}")
             return {
                 "status": "error",
-                "message": f"Failed to parse enclave response: {e}",
+                "message": "Internal server error during login",
             }
 
     except Exception as e:
-        return {"status": "error", "message": f"Verification failed: {str(e)}"}
+        logger.error(f"Login failed: {str(e)}")
+        return {"status": "error", "message": "Login failed"}
 
 
 @app.post("/api/decrypt-capsule")
@@ -536,25 +553,25 @@ async def decrypt_capsule(request: Request):
                 status = await contract.functions.getAccessStatus(cid, address).call()
                 # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
                 if status != 2:
-                    print(f"[EC2] Access not approved for {address} on {cid}")
+                    logger.warning(f"[EC2] Access not approved for {address} on {cid}")
                     return {
                         "status": "error",
                         "message": "Access not approved on-chain",
                     }
             except Exception as e:
-                print(f"Warning: Could not verify on-chain access: {e}")
+                logger.warning(f"Warning: Could not verify on-chain access: {e}")
 
-        print(f"[EC2] Decrypt capsule request for {address}")
+        logger.info(f"[EC2] Decrypt capsule request for {address}")
         ciphertext_hex = None
         try:
-            print(f"[EC2] Fetching ciphertext from blockchain for {cid}")
+            logger.info(f"[EC2] Fetching ciphertext from blockchain for {cid}")
             file_data = await fetch_file_blockchain(cid)
             # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
             ciphertext_bytes = file_data[3]
             ciphertext_hex = ciphertext_bytes.hex()
-            print(f"[EC2] Ciphertext length: {len(ciphertext_hex)}")
+            logger.info(f"[EC2] Ciphertext length: {len(ciphertext_hex)}")
         except Exception as e:
-            print(f"[EC2] Failed to fetch ciphertext from chain: {e}")
+            logger.error(f"[EC2] Failed to fetch ciphertext from chain: {e}")
             return {
                 "status": "error",
                 "message": "Failed to fetch ciphertext from blockchain",
@@ -564,7 +581,7 @@ async def decrypt_capsule(request: Request):
             return {"status": "error", "message": "Ciphertext not found on-chain"}
 
         # Forward to enclave for decryption
-        print("[EC2] Forwarding decrypt request to enclave")
+        logger.info("[EC2] Forwarding decrypt request to enclave")
         payload = json.dumps(
             {
                 "action": "decrypt_capsule",
@@ -589,22 +606,24 @@ async def decrypt_capsule(request: Request):
             if data.get("status") == "error":
                 return data
             # Extract hex-encoded AES key from 'data' field
-            print("[EC2] Decrypt successful, returning AES key")
+            logger.info("[EC2] Decrypt successful, returning AES key")
             return {"status": "success", "aes_key": data.get("data")}
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Failed to parse enclave response: {e}")
             return {
                 "status": "error",
-                "message": f"Failed to parse enclave response: {e}",
+                "message": "Internal server error during decryption",
             }
 
     except Exception as e:
-        return {"status": "error", "message": f"Decryption failed: {str(e)}"}
+        logger.error(f"Decryption failed: {str(e)}")
+        return {"status": "error", "message": "Decryption failed"}
 
 
 @app.get("/api/capsule/{cid}")
 async def get_capsule(cid: str, requester: str, owner: str):
     """Get re-encrypted capsule for a file."""
-    print(f"[EC2] Get capsule request: cid={cid}, requester={requester}")
+    logger.info(f"[EC2] Get capsule request: cid={cid}, requester={requester}")
     redis = await get_redis()
 
     # Verify on-chain access status first
@@ -613,10 +632,11 @@ async def get_capsule(cid: str, requester: str, owner: str):
         status = await contract.functions.getAccessStatus(cid, requester).call()
         # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
         if status != 2:
-            print(f"[EC2] Access not approved for {requester} on {cid}")
+            logger.warning(f"[EC2] Access not approved for {requester} on {cid}")
             return {"status": "error", "message": "Access not approved on-chain"}
     except Exception as e:
-        return {"status": "error", "message": f"Access verification failed: {e}"}
+        logger.error(f"Access verification failed: {e}")
+        return {"status": "error", "message": "Access verification failed"}
 
     # Fetch file data from blockchain
     try:
@@ -632,18 +652,20 @@ async def get_capsule(cid: str, requester: str, owner: str):
         else:
             # It might be returned as a hex string with 0x prefix
             capsule = bytes(capsule)
-        print(f"[EC2] Chain owner: {chain_owner}")
+        logger.info(f"[EC2] Chain owner: {chain_owner}")
     except Exception as e:
-        return {"status": "error", "message": f"chain fetch failed: {e}"}
+        logger.error(f"Chain fetch failed: {e}")
+        return {"status": "error", "message": "Failed to fetch file data"}
 
     if chain_owner.lower() != owner.lower():
+        logger.warning(f"Owner mismatch: {chain_owner} != {owner}")
         return {"status": "error", "message": "owner mismatch"}
 
     # Get re-encryption key
     rk = await get_rk(redis, owner, requester)
     if not rk:
         return {"status": "error", "message": "could not obtain re-encryption key"}
-    print(f"[EC2] RK retrieved for {owner}->{requester}")
+    logger.info(f"[EC2] RK retrieved for {owner}->{requester}")
 
     # Get public keys and verifying keys for kfrag verification
     owner_pk_bytes, owner_vk_bytes = await get_public_key(redis, owner)
@@ -656,7 +678,7 @@ async def get_capsule(cid: str, requester: str, owner: str):
 
     # Perform re-encryption
     try:
-        print("[EC2] Re-encrypting capsule...")
+        logger.info("[EC2] Re-encrypting capsule...")
         reenc_capsule = await reencrypt_capsule(
             rk_bytes=rk,
             capsule_bytes=capsule,
@@ -664,9 +686,10 @@ async def get_capsule(cid: str, requester: str, owner: str):
             owner_vk_bytes=owner_vk_bytes,
             requester_pk_bytes=requester_pk_bytes,
         )
-        print("[EC2] Re-encryption successful")
+        logger.info("[EC2] Re-encryption successful")
     except Exception as e:
-        return {"status": "error", "message": f"reencryption failed: {e}"}
+        logger.error(f"Re-encryption failed: {e}")
+        return {"status": "error", "message": "Re-encryption failed"}
 
     return {
         "status": "success",
