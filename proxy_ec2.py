@@ -542,6 +542,7 @@ async def decrypt_capsule(request: Request):
         signature = body.get("signature")
         message = body.get("message")
         cfrag = body.get("cfrag", "")
+        ephemeral_public_key = body.get("ephemeral_public_key")
 
         if not address or not capsule_hex:
             return {"status": "error", "message": "Missing address or capsule"}
@@ -594,6 +595,7 @@ async def decrypt_capsule(request: Request):
                 "owner": owner_address,
                 "signature": signature,
                 "message": message,
+                "ephemeral_public_key": ephemeral_public_key,
             }
         ).encode()
 
@@ -605,9 +607,9 @@ async def decrypt_capsule(request: Request):
             data = json.loads(response.decode("utf-8"))
             if data.get("status") == "error":
                 return data
-            # Extract hex-encoded AES key from 'data' field
-            logger.info("[EC2] Decrypt successful, returning AES key")
-            return {"status": "success", "aes_key": data.get("data")}
+
+            logger.info("[EC2] Decrypt successful, returning Encrypted Response")
+            return data
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Failed to parse enclave response: {e}")
             return {
