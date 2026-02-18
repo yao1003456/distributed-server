@@ -370,11 +370,17 @@ async def lifespan(_: FastAPI):
     else:
         w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
     try:
-        await w3_client.provider.connect()
-        if await w3_client.is_connected():
-            logger.info(f"Connected to Ethereum node at {RPC_URL}")
+        if not RPC_URL.startswith("http"):
+            await w3_client.provider.connect()
+            if await w3_client.is_connected():
+                logger.info(f"Connected to Ethereum node at {RPC_URL}")
+            else:
+                logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
         else:
-            logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
+            if await w3_client.is_connected():
+                logger.info(f"Connected to Ethereum node at {RPC_URL}")
+            else:
+                logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
     except Exception as e:
         logger.error(f"Error connecting to Ethereum node: {e}")
 

@@ -364,35 +364,23 @@ class EnclaveServer:
         if not signature or not message:
             return self._error_response("Missing signature or message")
 
+        # Verify Message Binding to CID and Ephemeral Key (MITM Protection)
+        # Message format: "Sign to decrypt file: <CID> with session key: <EPHEMERAL_KEY>"
+        expected_message = (
+            f"Sign to decrypt file: {cid} with session key: {ephemeral_public_key_hex}"
+        )
+
+        if message != expected_message:
+            print(
+                f"[ENCLAVE] IMPERSONATION ATTEMPT! Message '{message}' does not match expected '{expected_message}'"
+            )
+            return self._error_response(
+                "Invalid signature binding. Message does not match expected format with keys."
+            )
+
+        # Verify the signature against the STRICTLY formatted message
         if not self._verify_signature(address, message, signature):
             return self._error_response("Invalid signature for decryption")
-
-        # Verify Message Binding to CID (Replay Protection)
-        # TODO: fix replay protection logic, this may not be secure
-        if cid:
-            # Message format: "Sign to decrypt file: <CID>"
-            if not message.strip().endswith(cid):
-                print(
-                    f"[ENCLAVE] Replay Attack Detected! Message '{message}' does not match CID '{cid}'"
-                )
-                return self._error_response(
-                    "Invalid signature binding. Message does not match file CID."
-                )
-        else:
-            print(
-                "[ENCLAVE] Warning: CID signature binding check skipped (CID missing in payload) for decryption"
-            )
-
-        # Verify binding of ephemeral key to the signature to prevent MITM
-        # The message signed by the wallet MUST contain the ephemeral public key
-        # Message format: "Sign to decrypt file: <CID> with key: <EPHEMERAL_KEY>"
-        # For POC we will just check if it's in the message string
-        if ephemeral_public_key_hex not in message:
-            print(
-                "[ENCLAVE] Warning: Ephemeral key not bound to signature! MITM possible."
-            )
-            # In production, strict format checking is required.
-            # return self._error_response("Ephemeral key not signed")
 
         # Get the requester's keys
         user_keys = self.key_store.get_user_keys(address)
