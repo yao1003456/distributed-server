@@ -13,7 +13,7 @@ from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
 from dotenv import load_dotenv
 
-# Configure Logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,7 +36,6 @@ redis_pool = None
 w3_client = None
 
 
-# helper functions for blockchain interaction
 async def get_web3():
     """Get a Web3 instance with appropriate provider."""
     global w3_client
@@ -176,7 +175,6 @@ def parse_enclave_response(response: bytes | None) -> bytes | None:
         return None
 
 
-# uses rk to re-encrypt capsule from owner to requester
 async def reencrypt_capsule(
     rk_bytes: bytes,
     capsule_bytes: bytes,
@@ -304,7 +302,6 @@ async def event_listener():
         await asyncio.sleep(5)
 
 
-# forwards payload to enclave and retrieves response
 async def forward_enclave(payload: bytes) -> bytes | None:
     """Forward payload to enclave via VSOCK (or TCP in local mode)."""
     import os
@@ -359,7 +356,7 @@ async def forward_enclave(payload: bytes) -> bytes | None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global redis_pool, w3_client
-    # runs on startup
+    # Startup
     redis_pool = await redis.from_url(REDIS_URL)
 
     # Initialize Web3
@@ -386,7 +383,7 @@ async def lifespan(_: FastAPI):
 
     task = asyncio.create_task(event_listener())
     yield
-    # runs on shutdown
+    # Shutdown
     task.cancel()
     try:
         await task
@@ -397,7 +394,6 @@ async def lifespan(_: FastAPI):
         await redis_pool.close()
 
 
-# -------------- server API and routes -----------------
 app = FastAPI(lifespan=lifespan)
 
 allowed_origins = [

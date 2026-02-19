@@ -36,11 +36,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
-# VSOCK Configuration
+
 VSOCK_PORT = 12345
 VSOCK_CID_ANY = 0xFFFFFFFF  # Listen on any CID (VMADDR_CID_ANY)
 
-# Enclave configuration
+
 THRESHOLD = 1  # Number of kfrags needed to reconstruct (N of M threshold scheme)
 NUM_KFRAGS = 1  # Total number of kfrags to generate
 
