@@ -13,7 +13,6 @@ from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
 from dotenv import load_dotenv
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,17 +22,180 @@ logger = logging.getLogger(__name__)
 
 load_dotenv(".env.local")
 
-with open("abi.json", "r") as f:
-    CONTRACT_ABI = json.load(f)
-RPC_URL = os.getenv("RPC_URL")
-CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
-REDIS_URL = os.getenv("REDIS_URL")
+# Load ABI
+try:
+    with open("abi.json", "r") as f:
+        CONTRACT_ABI = json.load(f)
+except Exception as e:
+    logger.warning(f"Could not load abi.json: {e}")
+    CONTRACT_ABI = []
+
+RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:8545")
+CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS", "")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 RK_TTL_SECONDS = 3600
-ENCLAVE_CID = 16  # CID for VSOCK connection to enclave (parent VM is typically 3, enclave is assigned)
+ENCLAVE_CID = 16  # CID for VSOCK connection to enclave
 ENCLAVE_PORT = 12345
+ENCLAVE_STORAGE_DIR = "enclave_storage"
+
+os.makedirs(ENCLAVE_STORAGE_DIR, exist_ok=True)
 
 redis_pool = None
 w3_client = None
+
+
+def save_enclave_state(encrypted_master_key: str | None, encrypted_state: str | None):
+    """Save encrypted state to disk."""
+    try:
+        if encrypted_master_key:
+            with open(
+                os.path.join(ENCLAVE_STORAGE_DIR, "encrypted_master_key.bin"), "w"
+            ) as f:
+                f.write(encrypted_master_key)
+
+        if encrypted_state:
+            with open(
+                os.path.join(ENCLAVE_STORAGE_DIR, "encrypted_state.bin"), "w"
+            ) as f:
+                f.write(encrypted_state)
+
+        if encrypted_master_key or encrypted_state:
+            logger.info("[EC2] Enclave state saved to disk")
+    except Exception as e:
+        logger.error(f"[EC2] Failed to save enclave state: {e}")
+
+
+def load_enclave_state() -> tuple[str | None, str | None]:
+    """Load encrypted state from disk."""
+    mk = None
+    state = None
+    try:
+        mk_path = os.path.join(ENCLAVE_STORAGE_DIR, "encrypted_master_key.bin")
+        state_path = os.path.join(ENCLAVE_STORAGE_DIR, "encrypted_state.bin")
+
+        if os.path.exists(mk_path):
+            with open(mk_path, "r") as f:
+                mk = f.read().strip()
+
+        if os.path.exists(state_path):
+            with open(state_path, "r") as f:
+                state = f.read().strip()
+
+        return mk, state
+    except Exception as e:
+        logger.error(f"[EC2] Failed to load enclave state: {e}")
+        return None, None
+
+
+def process_enclave_response(response_bytes: bytes | None) -> dict | None:
+    """
+    Parse enclave response, handle state persistence, and return data dict.
+    Returns None on error.
+    """
+    if not response_bytes:
+        return None
+
+    try:
+        data = json.loads(response_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            logger.error("Invalid response format")
+            return None
+
+        # Check for state update
+        new_state = data.get("new_encrypted_state")
+        master_key = data.get("encrypted_master_key")  # from init
+        initial_state = data.get("encrypted_state")  # from init
+
+        if new_state:
+            save_enclave_state(None, new_state)
+        elif master_key and initial_state:
+            save_enclave_state(master_key, initial_state)
+
+        if data.get("status") == "error":
+            logger.error(f"Enclave Error: {data.get('message')}")
+            return data
+
+        return data
+    except Exception as e:
+        logger.error(f"Failed to process enclave response: {e}")
+        return None
+
+
+async def forward_enclave(payload: bytes) -> bytes | None:
+    """Forward payload to enclave via VSOCK (or TCP in local mode)."""
+    import os
+
+    is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
+
+    try:
+        if is_local:
+            # Local mode: use TCP
+            reader, writer = await asyncio.open_connection("127.0.0.1", ENCLAVE_PORT)
+        else:
+            # AWS server mode: use VSOCK
+            import socket
+
+            if not hasattr(socket, "AF_VSOCK"):
+                raise RuntimeError("AF_VSOCK not available")
+
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)  # type: ignore
+            sock.setblocking(False)
+
+            loop = asyncio.get_event_loop()
+            await loop.sock_connect(sock, (ENCLAVE_CID, ENCLAVE_PORT))
+
+            reader, writer = await asyncio.open_connection(sock=sock)
+
+        # Send length-prefixed message for proper framing
+        logger.info(f"[EC2] Forwarding {len(payload)} bytes to enclave")
+        length_prefix = len(payload).to_bytes(4, "big")
+        writer.write(length_prefix + payload)
+        await writer.drain()
+
+        # Read response length first
+        length_bytes = await reader.readexactly(4)
+        response_length = int.from_bytes(length_bytes, "big")
+
+        # Read the full response
+        data = await reader.readexactly(response_length)
+        logger.info(f"[EC2] Received {len(data)} bytes from enclave")
+
+        writer.close()
+        await writer.wait_closed()
+        return data
+
+    except asyncio.IncompleteReadError as e:
+        logger.error(f"Incomplete read from enclave: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Connection error: {e}")
+        return None
+
+
+async def init_enclave():
+    """Initialize enclave with stored state."""
+    mk, state = load_enclave_state()
+
+    action = "init"
+    payload_dict = {"action": action}
+
+    if mk and state:
+        logger.info("[EC2] Found persisted state, restoring enclave...")
+        payload_dict["encrypted_master_key"] = mk
+        payload_dict["encrypted_state"] = state
+    else:
+        logger.info("[EC2] No persisted state, initializing new enclave...")
+        kms_key = os.getenv("KMS_KEY_ID")
+        if kms_key:
+            payload_dict["kms_key_id"] = kms_key
+
+    response = await forward_enclave(json.dumps(payload_dict).encode())
+    res_data = process_enclave_response(response)
+
+    if res_data and res_data.get("status") == "success":
+        logger.info("[EC2] Enclave initialized successfully")
+    else:
+        logger.error("[EC2] Enclave initialization failed")
 
 
 async def get_web3():
@@ -50,7 +212,10 @@ async def get_web3():
 async def get_contract():
     w3 = await get_web3()
     contract = w3.eth.contract(
-        address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=CONTRACT_ABI
+        address=(
+            Web3.to_checksum_address(CONTRACT_ADDRESS) if CONTRACT_ADDRESS else None
+        ),
+        abi=CONTRACT_ABI,
     )
     return contract, w3
 
@@ -88,11 +253,15 @@ async def get_rk(redis, owner: str, requester: str):
     ).encode()
 
     response = await forward_enclave(payload)
-    rk = parse_enclave_response(response)
+    data = process_enclave_response(response)
 
-    if rk:
-        await redis.set(rk_key, rk, ex=RK_TTL_SECONDS)
-    return rk
+    if data and data.get("status") == "success":
+        rk_hex = data.get("data")
+        if rk_hex:
+            rk = bytes.fromhex(rk_hex)
+            await redis.set(rk_key, rk, ex=RK_TTL_SECONDS)
+            return rk
+    return None
 
 
 async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | None]:
@@ -120,15 +289,9 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
     ).encode()
 
     response = await forward_enclave(payload)
-    if response is None:
-        return None, None
+    data = process_enclave_response(response)
 
-    try:
-        data = json.loads(response.decode("utf-8"))
-        if data.get("status") == "error":
-            logger.error(f"Enclave error: {data.get('message')}")
-            return None, None
-
+    if data and data.get("status") == "success":
         pk_hex = data.get("public_key")
         vk_hex = data.get("verifying_key")
 
@@ -140,39 +303,7 @@ async def get_public_key(redis, address: str) -> tuple[bytes | None, bytes | Non
             await redis.set(vk_key, vk, ex=RK_TTL_SECONDS * 24)
             logger.info(f"[EC2] PK/VK cached for {address}")
             return pk, vk
-        return None, None
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error(f"Failed to parse enclave response: {e}")
-        return None, None
-
-
-def parse_enclave_response(response: bytes | None) -> bytes | None:
-    """
-    Parse enclave response which is always JSON with hex-encoded data.
-
-    Expected format:
-    - Success: {"status": "success", "data": "hex..."}
-    - Error: {"status": "error", "message": "..."}
-    """
-    if response is None:
-        return None
-
-    try:
-        data = json.loads(response.decode("utf-8"))
-        if not isinstance(data, dict):
-            logger.error("Enclave response is not a valid dictionary.")
-            return None
-        if data.get("status") == "error":
-            logger.error(f"Enclave error: {data.get('message')}")
-            return None
-        if "data" in data:
-            # Data is hex-encoded
-            return bytes.fromhex(data["data"])
-        logger.error("Enclave response missing 'data' field.")
-        return None
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error(f"Failed to parse enclave response as JSON: {e}")
-        return None
+    return None, None
 
 
 async def reencrypt_capsule(
@@ -216,11 +347,20 @@ async def reencrypt_capsule(
 
 
 async def event_listener():
+    # Only run event listener if Contract Address is set
+    if not CONTRACT_ADDRESS:
+        logger.info("CONTRACT_ADDRESS not set, skipping event listener")
+        return
+
     contract, w3 = await get_contract()
     redis = await get_redis()
 
     # Get the latest block as starting point
-    latest_block = await w3.eth.block_number
+    try:
+        latest_block = await w3.eth.block_number
+    except:
+        logger.error("Could not fetch block number, skipping event listener startup")
+        return
 
     while True:
         try:
@@ -302,57 +442,6 @@ async def event_listener():
         await asyncio.sleep(5)
 
 
-async def forward_enclave(payload: bytes) -> bytes | None:
-    """Forward payload to enclave via VSOCK (or TCP in local mode)."""
-    import os
-
-    is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
-
-    try:
-        if is_local:
-            # Local mode: use TCP
-            reader, writer = await asyncio.open_connection("127.0.0.1", ENCLAVE_PORT)
-        else:
-            # AWS server mode: use VSOCK
-            import socket
-
-            if not hasattr(socket, "AF_VSOCK"):
-                raise RuntimeError("AF_VSOCK not available")
-
-            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)  # type: ignore
-            sock.setblocking(False)
-
-            loop = asyncio.get_event_loop()
-            await loop.sock_connect(sock, (ENCLAVE_CID, ENCLAVE_PORT))
-
-            reader, writer = await asyncio.open_connection(sock=sock)
-
-        # Send length-prefixed message for proper framing
-        logger.info(f"[EC2] Forwarding {len(payload)} bytes to enclave")
-        length_prefix = len(payload).to_bytes(4, "big")
-        writer.write(length_prefix + payload)
-        await writer.drain()
-
-        # Read response length first
-        length_bytes = await reader.readexactly(4)
-        response_length = int.from_bytes(length_bytes, "big")
-
-        # Read the full response
-        data = await reader.readexactly(response_length)
-        logger.info(f"[EC2] Received {len(data)} bytes from enclave")
-
-        writer.close()
-        await writer.wait_closed()
-        return data
-
-    except asyncio.IncompleteReadError as e:
-        logger.error(f"Incomplete read from enclave: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Connection error: {e}")
-        return None
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global redis_pool, w3_client
@@ -366,20 +455,17 @@ async def lifespan(_: FastAPI):
         w3_client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(RPC_URL))
     else:
         w3_client = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_URL))
+
     try:
-        if not RPC_URL.startswith("http"):
-            await w3_client.provider.connect()
-            if await w3_client.is_connected():
-                logger.info(f"Connected to Ethereum node at {RPC_URL}")
-            else:
-                logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
+        if await w3_client.is_connected():
+            logger.info(f"Connected to Ethereum node at {RPC_URL}")
         else:
-            if await w3_client.is_connected():
-                logger.info(f"Connected to Ethereum node at {RPC_URL}")
-            else:
-                logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
+            logger.error(f"Failed to connect to Ethereum node at {RPC_URL}")
     except Exception as e:
-        logger.error(f"Error connecting to Ethereum node: {e}")
+        logger.error(f"Error checking Ethereum connection: {e}")
+
+    # Init Enclave
+    await init_enclave()
 
     task = asyncio.create_task(event_listener())
     yield
@@ -389,7 +475,6 @@ async def lifespan(_: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
-    # Close Redis pool
     if redis_pool:
         await redis_pool.close()
 
@@ -448,9 +533,6 @@ async def get_nonce():
 async def verify_siwe(request: Request):
     """
     Verify SIWE signature and retrieve user's public key from enclave.
-
-    The enclave generates and stores the PRE keypair.
-    Client only receives the public key (sk NEVER leaves enclave).
     """
     import time
 
@@ -487,7 +569,6 @@ async def verify_siwe(request: Request):
         address = siwe_message.address
 
         # Forward to enclave for registration/login
-        # Enclave will generate keypair if new user, or return existing pk
         payload = json.dumps(
             {
                 "action": "login",
@@ -498,13 +579,9 @@ async def verify_siwe(request: Request):
         ).encode("utf-8")
 
         response = await forward_enclave(payload)
-        if not response:
-            return {"status": "error", "message": "Failed to communicate with enclave"}
+        data = process_enclave_response(response)  # Use helper
 
-        try:
-            data = json.loads(response.decode("utf-8"))
-            if data.get("status") == "error":
-                return {"status": "error", "message": data.get("message")}
+        if data and data.get("status") == "success":
             logger.info("[EC2] Enclave login successful")
             return {
                 "status": "success",
@@ -512,11 +589,10 @@ async def verify_siwe(request: Request):
                 "verifying_key": data.get("verifying_key"),
                 "address": data.get("address"),
             }
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error(f"Failed to parse enclave response: {e}")
+        else:
             return {
                 "status": "error",
-                "message": "Internal server error during login",
+                "message": data.get("message") if data else "Enclave Error",
             }
 
     except Exception as e:
@@ -527,12 +603,7 @@ async def verify_siwe(request: Request):
 @app.post("/api/decrypt-capsule")
 async def decrypt_capsule(request: Request):
     """
-    Request enclave to decrypt a capsule using user's stored secret key.
-
-    For owner's own files: decrypt directly
-    For shared files: decrypt re-encrypted capsule (cfrag)
-
-    Returns: The decrypted AES key (not the file contents)
+    Request enclave to decrypt a capsule.
     """
     try:
         body = await request.json()
@@ -602,22 +673,13 @@ async def decrypt_capsule(request: Request):
         ).encode()
 
         response = await forward_enclave(payload)
-        if not response:
-            return {"status": "error", "message": "Failed to communicate with enclave"}
+        data = process_enclave_response(response)  # Use helper
 
-        try:
-            data = json.loads(response.decode("utf-8"))
-            if data.get("status") == "error":
-                return data
-
-            logger.info("[EC2] Decrypt successful, returning Encrypted Response")
+        if data and data.get("status") == "success":
+            logger.info("[EC2] Decrypt successful")
             return data
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error(f"Failed to parse enclave response: {e}")
-            return {
-                "status": "error",
-                "message": "Internal server error during decryption",
-            }
+        else:
+            return data if data else {"status": "error", "message": "Enclave error"}
 
     except Exception as e:
         logger.error(f"Decryption failed: {str(e)}")
@@ -648,7 +710,6 @@ async def get_capsule(cid: str, requester: str, owner: str):
         chain_owner = file_data[0]
         capsule = file_data[2]  # Now bytes from contract
         # Convert bytes to proper format if needed
-        # TODO: Check if this is needed, and ensure consistent return type from contract
         if isinstance(capsule, str):
             capsule = bytes.fromhex(capsule.replace("0x", ""))
         elif isinstance(capsule, bytes):
