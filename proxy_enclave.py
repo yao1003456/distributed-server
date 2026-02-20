@@ -46,7 +46,7 @@ THRESHOLD = 1  # Number of kfrags needed to reconstruct (N of M threshold scheme
 NUM_KFRAGS = 1  # Total number of kfrags to generate
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
-KMS_PROXY_PORT = 8000
+KMS_PROXY_PORT = 8001
 
 
 class KMSService:

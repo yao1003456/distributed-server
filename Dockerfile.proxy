@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY proxy_ec2.py .
+COPY abi.json .
 COPY .env.local .
 
 # Default port for FastAPI
