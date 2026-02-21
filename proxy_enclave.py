@@ -82,8 +82,8 @@ class KMSService:
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             for line in result.stdout.splitlines():
-                if line.startswith("Plaintext:"):
-                    return base64.b64decode(line.split(":")[1].strip())
+                if line.startswith("PLAINTEXT:") or line.startswith("Plaintext:"):
+                    return base64.b64decode(line.split(":", 1)[1].strip())
 
             raise RuntimeError("No plaintext found in kmstool output")
         except subprocess.CalledProcessError as e:
@@ -125,16 +125,14 @@ class KMSService:
                 )
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            print(f"[DEBUG] kmstool genkey stdout: {result.stdout}")
-            print(f"[DEBUG] kmstool genkey stderr: {result.stderr}")
             plaintext = None
             ciphertext = None
 
             for line in result.stdout.splitlines():
-                if line.startswith("Plaintext:"):
-                    plaintext = base64.b64decode(line.split(":")[1].strip())
-                if line.startswith("CiphertextBlob:"):
-                    ciphertext = line.split(":")[1].strip()
+                if line.startswith("PLAINTEXT:") or line.startswith("Plaintext:"):
+                    plaintext = base64.b64decode(line.split(":", 1)[1].strip())
+                if line.startswith("CIPHERTEXT:") or line.startswith("CiphertextBlob:"):
+                    ciphertext = line.split(":", 1)[1].strip()
 
             if not plaintext or not ciphertext:
                 raise RuntimeError("Failed to parse genkey output")
