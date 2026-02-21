@@ -203,8 +203,8 @@ class SecureKeyStore:
         state = {
             "user_keys": self.user_keys,
             "proxy_keys": {
-                "secret": bytes(self.proxy_secret_key),
-                "signing": bytes(self.proxy_signing_key),
+                "secret": self.proxy_secret_key.to_be_bytes(),
+                "signing": self.proxy_signing_key.to_be_bytes(),
             },
         }
         return pickle.dumps(state)
@@ -216,8 +216,8 @@ class SecureKeyStore:
         # Restore proxy identity
         p_keys = state.get("proxy_keys", {})
         if p_keys:
-            self.proxy_secret_key = SecretKey.from_bytes(p_keys["secret"])
-            self.proxy_signing_key = SecretKey.from_bytes(p_keys["signing"])
+            self.proxy_secret_key = SecretKey.from_be_bytes(p_keys["secret"])
+            self.proxy_signing_key = SecretKey.from_be_bytes(p_keys["signing"])
             # Re-derive public keys
             self.__post_init__()
 
