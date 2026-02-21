@@ -108,6 +108,8 @@ class KMSService:
                 str(KMS_PROXY_PORT),
                 "--key-id",
                 key_id,
+                "--key-spec",
+                "AES_256",
             ]
 
             if credentials:
