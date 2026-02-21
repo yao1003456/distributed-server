@@ -87,11 +87,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy proxy application code
 COPY proxy_enclave.py .
 
+# Copy debug entrypoint
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
 # Optional: Document the port used for local VSOCK communication
 EXPOSE 12345
 
 # Ensure Python output is not buffered (critical for enclave console logging)
 ENV PYTHONUNBUFFERED=1
 
-# Command to run the proxy server
-CMD ["python", "proxy_enclave.py"]
+# Use entrypoint wrapper for crash debugging
+CMD ["/bin/bash", "/app/entrypoint.sh"]
