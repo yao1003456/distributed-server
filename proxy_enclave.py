@@ -203,8 +203,8 @@ class SecureKeyStore:
         state = {
             "user_keys": self.user_keys,
             "proxy_keys": {
-                "secret": self.proxy_secret_key.to_bytes(),
-                "signing": self.proxy_signing_key.to_bytes(),
+                "secret": self.proxy_secret_key.to_secret_bytes(),
+                "signing": self.proxy_signing_key.to_secret_bytes(),
             },
         }
         return pickle.dumps(state)
