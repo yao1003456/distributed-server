@@ -1,35 +1,23 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-WORKDIR /app
-
-# Install system dependencies
+# Install necessary system dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
-    git \
-    wget \
+    gcc \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install kmstool-enclave-cli from source
-# Build environment for the kmstool using CMake
-RUN apt-get update && apt-get install -y gcc make cmake libssl-dev libjson-c-dev && \
-    git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git && \
-    cd aws-nitro-enclaves-sdk-c && \
-    mkdir build && cd build && \
-    cmake .. && \
-    make && \
-    cd ../bin/kmstool-enclave-cli && \
-    mkdir build && cd build && \
-    cmake .. && \
-    make && \
-    cp kmstool-enclave-cli /usr/local/bin/ && \
-    chmod +x /usr/local/bin/kmstool-enclave-cli && \
-    cd /app && rm -rf aws-nitro-enclaves-sdk-c
+# Create working directory
+WORKDIR /app
+
 # Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy enclave source code
 COPY proxy_enclave.py .
 
-# The enclave runs the python script directly or via a wrapper
-CMD ["python3", "/app/proxy_enclave.py"]
+# Expose the standard port the enclave listens on natively (before vsock)
+EXPOSE 5000
+
+# Set entrypoint to run the enclave application
+ENTRYPOINT ["python3", "proxy_enclave.py"]

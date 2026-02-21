@@ -1,0 +1,20 @@
+[Unit]
+Description=Proxy EC2 Gunicorn Daemon
+After=network.target
+
+[Service]
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/Dissertation-project/distributed-server
+Environment="PATH=/home/ec2-user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+EnvironmentFile=/home/ec2-user/Dissertation-project/distributed-server/.env.production
+ExecStart=/home/ec2-user/.local/bin/gunicorn proxy_ec2:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+
+# Security and Limits
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
