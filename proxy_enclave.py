@@ -109,7 +109,7 @@ class KMSService:
                 "--key-id",
                 key_id,
                 "--key-spec",
-                "AES_256",
+                "AES-256",
             ]
 
             if credentials:
