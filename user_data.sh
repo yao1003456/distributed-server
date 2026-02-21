@@ -22,7 +22,7 @@ sudo systemctl enable --now nitro-enclaves-allocator.service
 
 # Run vsock-proxy for KMS on host (Map port 8001 to KMS)
 # NOTE: This assumes the instance has an IAM role with KMS permissions
-vsock-proxy 8001 kms.us-east-1.amazonaws.com 443 &
+vsock-proxy 8001 kms.eu-west-2.amazonaws.com 443 &
 
 # Build and Run Enclave
 # Need to build the EIF first

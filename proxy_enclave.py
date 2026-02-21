@@ -45,7 +45,7 @@ VSOCK_CID_ANY = 0xFFFFFFFF  # Listen on any CID (VMADDR_CID_ANY)
 THRESHOLD = 1  # Number of kfrags needed to reconstruct (N of M threshold scheme)
 NUM_KFRAGS = 1  # Total number of kfrags to generate
 
-REGION = os.getenv("AWS_REGION", "us-east-1")
+REGION = os.getenv("AWS_REGION", "eu-west-2")
 KMS_PROXY_PORT = 8001
 
 
