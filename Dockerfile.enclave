@@ -1,23 +1,42 @@
-FROM python:3.10-slim
+# Stage 1: Build the kmstool-enclave-cli
+FROM amazonlinux:2023 as builder
 
-# Install necessary system dependencies
+RUN dnf update -y && \
+    dnf install -y gcc gcc-c++ make cmake git zip jq tar \
+    openssl-devel zlib-devel wget aws-cli
+
+# Clone and compile aws-nitro-enclaves-sdk-c
+RUN git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git /sdk
+WORKDIR /sdk
+RUN ./build.sh --enable-kmstool
+
+# Stage 2: Runtime Environment
+FROM python:3.11-slim
+
+# Install necessary system dependencies for cryptography and networking
 RUN apt-get update && apt-get install -y \
     gcc \
-    libssl-dev \
+    curl \
+    jq \
+    libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create working directory
+# Copy the compiled kmstool from the builder stage
+COPY --from=builder /sdk/bin/kmstool-enclave-cli /usr/local/bin/
+RUN chmod +x /usr/local/bin/kmstool-enclave-cli
+
+# Set up working directory
 WORKDIR /app
 
-# Copy requirements and install
+# Copy requirements and install them
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy enclave source code
+# Copy proxy application code
 COPY proxy_enclave.py .
 
-# Expose the standard port the enclave listens on natively (before vsock)
-EXPOSE 5000
+# Optional: Document the port used for local VSOCK communication
+EXPOSE 12345
 
-# Set entrypoint to run the enclave application
-ENTRYPOINT ["python3", "proxy_enclave.py"]
+# Command to run the proxy server
+CMD ["python", "proxy_enclave.py"]
