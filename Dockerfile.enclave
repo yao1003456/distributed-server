@@ -9,13 +9,18 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install kmstool-enclave-cli
-# NOTE: In a real deployment, verified binaries should be used.
-# This is a placeholder for where the binary installation would happen.
-# We will assume it is available or copied in.
-COPY kmstool-enclave-cli /usr/local/bin/kmstool-enclave-cli
-RUN chmod +x /usr/local/bin/kmstool-enclave-cli
-
+# Install kmstool-enclave-cli from source
+# Build environment for the kmstool
+RUN apt-get update && apt-get install -y gcc make libssl-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
+    git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git && \
+    cd aws-nitro-enclaves-sdk-c && \
+    cat README.md && \
+    export AWS_NITRO_ENCLAVES_SDK_C_BUILD_DIR=$(pwd)/build && \
+    cd bin/kmstool-enclave-cli && \
+    make && \
+    cp kmstool-enclave-cli /usr/local/bin/ && \
+    chmod +x /usr/local/bin/kmstool-enclave-cli && \
+    cd /app && rm -rf aws-nitro-enclaves-sdk-c
 # Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
