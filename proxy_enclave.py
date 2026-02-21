@@ -59,7 +59,7 @@ class KMSService:
         try:
             # Command: kmstool-enclave-cli decrypt --region ... --proxy-port ... --ciphertext ...
             cmd = [
-                "/usr/local/bin/kmstool-enclave-cli",
+                "/usr/local/bin/kmstool_enclave_cli",
                 "decrypt",
                 "--region",
                 REGION,
@@ -89,7 +89,7 @@ class KMSService:
         try:
             # Command: kmstool-enclave-cli genkey --region ... --proxy-port ... --key-id ...
             cmd = [
-                "/usr/local/bin/kmstool-enclave-cli",
+                "/usr/local/bin/kmstool_enclave_cli",
                 "genkey",
                 "--region",
                 REGION,
