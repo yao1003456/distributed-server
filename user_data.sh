@@ -26,7 +26,7 @@ vsock-proxy 8001 kms.eu-west-2.amazonaws.com 443 &
 
 # Build and Run Enclave
 # Need to build the EIF first
-cd /home/ec2-user/app
+cd /home/ec2-user/distributed-server
 
 # Ensure kmstool-enclave-cli placeholder exists so Docker build doesn't crash if missing
 touch kmstool-enclave-cli
@@ -42,7 +42,7 @@ nitro-cli run-enclave --cpu-count 2 --memory 4096 --eif-path /home/ec2-user/prox
 # Create directory for enclave state persistence
 mkdir -p /home/ec2-user/enclave_storage
 
-cd /home/ec2-user/app
+cd /home/ec2-user/distributed-server
 
 # Ensure .env.local and abi.json exist so Dockerfile doesn't crash
 touch .env.local
