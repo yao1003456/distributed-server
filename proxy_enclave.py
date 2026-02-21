@@ -125,6 +125,8 @@ class KMSService:
                 )
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            print(f"[DEBUG] kmstool genkey stdout: {result.stdout}")
+            print(f"[DEBUG] kmstool genkey stderr: {result.stderr}")
             plaintext = None
             ciphertext = None
 
