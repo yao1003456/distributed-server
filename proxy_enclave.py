@@ -51,13 +51,12 @@ KMS_PROXY_PORT = 8001
 
 class KMSService:
     @staticmethod
-    def decrypt(ciphertext_b64: str) -> bytes:
+    def decrypt(ciphertext_b64: str, credentials: dict | None = None) -> bytes:
         """
         Decrypts ciphertext using AWS KMS via kmstool-enclave-cli.
         Requires vsock-proxy running on host at KMS_PROXY_PORT.
         """
         try:
-            # Command: kmstool-enclave-cli decrypt --region ... --proxy-port ... --ciphertext ...
             cmd = [
                 "/usr/local/bin/kmstool_enclave_cli",
                 "decrypt",
@@ -69,8 +68,19 @@ class KMSService:
                 ciphertext_b64,
             ]
 
+            if credentials:
+                cmd.extend(
+                    [
+                        "--aws-access-key-id",
+                        credentials["aws_access_key_id"],
+                        "--aws-secret-access-key",
+                        credentials["aws_secret_access_key"],
+                        "--aws-session-token",
+                        credentials["aws_session_token"],
+                    ]
+                )
+
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            # Output format: "Plaintext: <base64_encoded_plaintext>"
             for line in result.stdout.splitlines():
                 if line.startswith("Plaintext:"):
                     return base64.b64decode(line.split(":")[1].strip())
@@ -81,13 +91,14 @@ class KMSService:
             raise e
 
     @staticmethod
-    def generate_data_key(key_id: str) -> tuple[bytes, str]:
+    def generate_data_key(
+        key_id: str, credentials: dict | None = None
+    ) -> tuple[bytes, str]:
         """
         Generates a data key from KMS.
         Returns (plaintext_key, ciphertext_blob_b64).
         """
         try:
-            # Command: kmstool-enclave-cli genkey --region ... --proxy-port ... --key-id ...
             cmd = [
                 "/usr/local/bin/kmstool_enclave_cli",
                 "genkey",
@@ -98,6 +109,18 @@ class KMSService:
                 "--key-id",
                 key_id,
             ]
+
+            if credentials:
+                cmd.extend(
+                    [
+                        "--aws-access-key-id",
+                        credentials["aws_access_key_id"],
+                        "--aws-secret-access-key",
+                        credentials["aws_secret_access_key"],
+                        "--aws-session-token",
+                        credentials["aws_session_token"],
+                    ]
+                )
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             plaintext = None
@@ -207,6 +230,7 @@ class EnclaveServer:
         self.is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
         self.kms_key_id = os.getenv("KMS_KEY_ID")
         self.last_enclave_ephemeral_pub = b""
+        self.aws_credentials: dict | None = None
 
     async def handle_request(self, data: bytes) -> bytes:
         """
@@ -252,6 +276,12 @@ class EnclaveServer:
         if self.is_local:
             return self._success_response(b"Local mode initialized")
 
+        # Store credentials from EC2 host
+        credentials = request.get("credentials")
+        if credentials:
+            self.aws_credentials = credentials
+            print("[ENCLAVE] Received AWS credentials from host")
+
         encrypted_mk_b64 = request.get("encrypted_master_key")
         encrypted_state_hex = request.get("encrypted_state")
         kms_key_id = request.get("kms_key_id") or self.kms_key_id
@@ -262,13 +292,12 @@ class EnclaveServer:
                 print("[ENCLAVE] Restoring state from Host...")
 
                 # 1. Decrypt Master Key via KMS
-                master_key = KMSService.decrypt(encrypted_mk_b64)
+                master_key = KMSService.decrypt(encrypted_mk_b64, self.aws_credentials)
                 self.key_store.master_key = master_key
 
                 # 2. Decrypt State with Master Key
                 encrypted_state = bytes.fromhex(encrypted_state_hex)
                 aesgcm = AESGCM(master_key)
-                # We expect nonce prepended
                 nonce = encrypted_state[:12]
                 ciphertext = encrypted_state[12:]
 
@@ -285,7 +314,9 @@ class EnclaveServer:
                     return self._error_response("Missing KMS Key ID for initialization")
 
                 # 1. Generate new Master Key via KMS
-                master_key, encrypted_mk_b64 = KMSService.generate_data_key(kms_key_id)
+                master_key, encrypted_mk_b64 = KMSService.generate_data_key(
+                    kms_key_id, self.aws_credentials
+                )
                 self.key_store.master_key = master_key
 
                 # 2. Encrypt empty state

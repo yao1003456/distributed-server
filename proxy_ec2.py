@@ -11,6 +11,7 @@ from web3 import AsyncWeb3, Web3
 from siwe import SiweMessage
 from umbral_pre import Capsule, KeyFrag, reencrypt, PublicKey
 import os
+import urllib.request
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -172,12 +173,60 @@ async def forward_enclave(payload: bytes) -> bytes | None:
         return None
 
 
+def fetch_iam_credentials() -> dict | None:
+    """Fetch temporary IAM role credentials from EC2 instance metadata (IMDSv2)."""
+    try:
+        # Step 1: Get IMDSv2 token
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+        )
+        with urllib.request.urlopen(token_req, timeout=3) as resp:
+            token = resp.read().decode()
+
+        headers = {"X-aws-ec2-metadata-token": token}
+
+        # Step 2: Get the role name
+        role_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            headers=headers,
+        )
+        with urllib.request.urlopen(role_req, timeout=3) as resp:
+            role_name = resp.read().decode().strip()
+
+        # Step 3: Get the credentials
+        creds_req = urllib.request.Request(
+            f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}",
+            headers=headers,
+        )
+        with urllib.request.urlopen(creds_req, timeout=3) as resp:
+            creds = json.loads(resp.read().decode())
+
+        logger.info(f"[EC2] Fetched IAM credentials for role: {role_name}")
+        return {
+            "aws_access_key_id": creds["AccessKeyId"],
+            "aws_secret_access_key": creds["SecretAccessKey"],
+            "aws_session_token": creds["Token"],
+        }
+    except Exception as e:
+        logger.error(f"[EC2] Failed to fetch IAM credentials: {e}")
+        return None
+
+
 async def init_enclave():
     """Initialize enclave with stored state."""
     mk, state = load_enclave_state()
 
     action = "init"
     payload_dict = {"action": action}
+
+    # Fetch IAM credentials and forward to enclave
+    creds = fetch_iam_credentials()
+    if creds:
+        payload_dict["credentials"] = creds
+    else:
+        logger.warning("[EC2] No IAM credentials available for enclave init")
 
     if mk and state:
         logger.info("[EC2] Found persisted state, restoring enclave...")
