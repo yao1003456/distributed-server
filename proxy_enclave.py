@@ -15,6 +15,9 @@ import json
 import os
 import hashlib
 import secrets
+import subprocess
+import base64
+import pickle
 from typing import Optional
 from dataclasses import dataclass, field
 from umbral_pre import (
@@ -39,10 +42,80 @@ from cryptography.hazmat.backends import default_backend
 
 VSOCK_PORT = 12345
 VSOCK_CID_ANY = 0xFFFFFFFF  # Listen on any CID (VMADDR_CID_ANY)
-
-
 THRESHOLD = 1  # Number of kfrags needed to reconstruct (N of M threshold scheme)
 NUM_KFRAGS = 1  # Total number of kfrags to generate
+
+REGION = os.getenv("AWS_REGION", "eu-west-2")
+KMS_PROXY_PORT = 8001
+
+
+class KMSService:
+    @staticmethod
+    def decrypt(ciphertext_b64: str) -> bytes:
+        """
+        Decrypts ciphertext using AWS KMS via kmstool-enclave-cli.
+        Requires vsock-proxy running on host at KMS_PROXY_PORT.
+        """
+        try:
+            # Command: kmstool-enclave-cli decrypt --region ... --proxy-port ... --ciphertext ...
+            cmd = [
+                "/usr/local/bin/kmstool-enclave-cli",
+                "decrypt",
+                "--region",
+                REGION,
+                "--proxy-port",
+                str(KMS_PROXY_PORT),
+                "--ciphertext",
+                ciphertext_b64,
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Output format: "Plaintext: <base64_encoded_plaintext>"
+            for line in result.stdout.splitlines():
+                if line.startswith("Plaintext:"):
+                    return base64.b64decode(line.split(":")[1].strip())
+
+            raise RuntimeError("No plaintext found in kmstool output")
+        except subprocess.CalledProcessError as e:
+            print(f"KMS Decrypt Error: {e.stderr}")
+            raise e
+
+    @staticmethod
+    def generate_data_key(key_id: str) -> tuple[bytes, str]:
+        """
+        Generates a data key from KMS.
+        Returns (plaintext_key, ciphertext_blob_b64).
+        """
+        try:
+            # Command: kmstool-enclave-cli genkey --region ... --proxy-port ... --key-id ...
+            cmd = [
+                "/usr/local/bin/kmstool-enclave-cli",
+                "genkey",
+                "--region",
+                REGION,
+                "--proxy-port",
+                str(KMS_PROXY_PORT),
+                "--key-id",
+                key_id,
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            plaintext = None
+            ciphertext = None
+
+            for line in result.stdout.splitlines():
+                if line.startswith("Plaintext:"):
+                    plaintext = base64.b64decode(line.split(":")[1].strip())
+                if line.startswith("CiphertextBlob:"):
+                    ciphertext = line.split(":")[1].strip()
+
+            if not plaintext or not ciphertext:
+                raise RuntimeError("Failed to parse genkey output")
+
+            return plaintext, ciphertext
+        except subprocess.CalledProcessError as e:
+            print(f"KMS GenKey Error: {e.stderr}")
+            raise e
 
 
 @dataclass
@@ -59,15 +132,15 @@ class UserKeyPair:
 class SecureKeyStore:
     """
     Secure in-memory key storage for the enclave.
-
-    In a production environment, this would use:
-    - AWS Nitro Enclaves KMS integration for key derivation
-    - Attestation-based key release
-    - Encrypted persistence via parent instance
     """
 
     # Maps user address (lowercase) to their key pair
     user_keys: dict[str, UserKeyPair] = field(default_factory=dict)
+
+    # Master key for encrypting the user_keys when sending to host
+    # In memory, this is the plaintext key.
+    # The ciphertext of this key is stored on the Host.
+    master_key: Optional[bytes] = None
 
     # PRE proxy's own key pair for signing attestations
     proxy_secret_key: SecretKey = field(default_factory=SecretKey.random)
@@ -99,6 +172,30 @@ class SecureKeyStore:
             return True
         return False
 
+    def serialize_state(self) -> bytes:
+        """Serialize keys using pickle."""
+        # We only serialize the user keys and proxy keys, not the master key itself
+        state = {
+            "user_keys": self.user_keys,
+            "proxy_keys": {
+                "secret": self.proxy_secret_key.to_bytes(),
+                "signing": self.proxy_signing_key.to_bytes(),
+            },
+        }
+        return pickle.dumps(state)
+
+    def load_state(self, state_bytes: bytes):
+        state = pickle.loads(state_bytes)
+        self.user_keys = state.get("user_keys", {})
+
+        # Restore proxy identity
+        p_keys = state.get("proxy_keys", {})
+        if p_keys:
+            self.proxy_secret_key = SecretKey.from_bytes(p_keys["secret"])
+            self.proxy_signing_key = SecretKey.from_bytes(p_keys["signing"])
+            # Re-derive public keys
+            self.__post_init__()
+
 
 class EnclaveServer:
     """
@@ -108,6 +205,8 @@ class EnclaveServer:
     def __init__(self):
         self.key_store = SecureKeyStore()
         self.is_local = os.getenv("IS_LOCAL_ENV", "False").lower() == "true"
+        self.kms_key_id = os.getenv("KMS_KEY_ID")
+        self.last_enclave_ephemeral_pub = b""
 
     async def handle_request(self, data: bytes) -> bytes:
         """
@@ -124,7 +223,9 @@ class EnclaveServer:
             action = request.get("action")
             print(f"[ENCLAVE] Received action: {action}")
 
-            if action == "get_rk":
+            if action == "init":
+                return await self.handle_init(request)
+            elif action == "get_rk":
                 return await self.handle_get_rk(request)
             elif action == "get_public_key":
                 return await self.handle_get_public_key(request)
@@ -134,6 +235,8 @@ class EnclaveServer:
                 return await self.handle_get_proxy_public_key(request)
             elif action == "decrypt_capsule":
                 return await self.handle_decrypt_capsule(request)
+            elif action == "register":
+                return await self.handle_register(request)
             else:
                 return self._error_response(f"Unknown action: {action}")
 
@@ -141,6 +244,69 @@ class EnclaveServer:
             return self._error_response(f"Invalid JSON: {str(e)}")
         except Exception as e:
             return self._error_response(f"Internal error: {str(e)}")
+
+    async def handle_init(self, request: dict) -> bytes:
+        """
+        Initialize the enclave.
+        """
+        if self.is_local:
+            return self._success_response(b"Local mode initialized")
+
+        encrypted_mk_b64 = request.get("encrypted_master_key")
+        encrypted_state_hex = request.get("encrypted_state")
+        kms_key_id = request.get("kms_key_id") or self.kms_key_id
+
+        try:
+            if encrypted_mk_b64 and encrypted_state_hex:
+                # Restoration Flow
+                print("[ENCLAVE] Restoring state from Host...")
+
+                # 1. Decrypt Master Key via KMS
+                master_key = KMSService.decrypt(encrypted_mk_b64)
+                self.key_store.master_key = master_key
+
+                # 2. Decrypt State with Master Key
+                encrypted_state = bytes.fromhex(encrypted_state_hex)
+                aesgcm = AESGCM(master_key)
+                # We expect nonce prepended
+                nonce = encrypted_state[:12]
+                ciphertext = encrypted_state[12:]
+
+                state_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+                self.key_store.load_state(state_bytes)
+
+                print("[ENCLAVE] State restored successfully.")
+                return self._success_response(b"Restored")
+
+            else:
+                # New Initialization Flow
+                print("[ENCLAVE] Initializing new state...")
+                if not kms_key_id:
+                    return self._error_response("Missing KMS Key ID for initialization")
+
+                # 1. Generate new Master Key via KMS
+                master_key, encrypted_mk_b64 = KMSService.generate_data_key(kms_key_id)
+                self.key_store.master_key = master_key
+
+                # 2. Encrypt empty state
+                state_bytes = self.key_store.serialize_state()
+                aesgcm = AESGCM(master_key)
+                nonce = os.urandom(12)
+                ciphertext = aesgcm.encrypt(nonce, state_bytes, None)
+                encrypted_state = (nonce + ciphertext).hex()
+
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "data": "Initialized",
+                        "encrypted_master_key": encrypted_mk_b64,
+                        "encrypted_state": encrypted_state,
+                    }
+                ).encode("utf-8")
+
+        except Exception as e:
+            print(f"Init failed: {e}")
+            return self._error_response(f"Initialization failed: {e}")
 
     async def handle_get_rk(self, request: dict) -> bytes:
         """
@@ -162,9 +328,6 @@ class EnclaveServer:
         if not owner or not requester:
             return self._error_response("Missing owner or requester address")
         try:
-            # NOTE: Redis is not available in the enclave. This is a placeholder, a is simulated here
-            # TODO: implement a secure external cache or a simulated cache for local testing
-
             owner_keys = self.key_store.get_user_keys(owner.lower())
             requester_keys = self.key_store.get_user_keys(requester.lower())
 
@@ -256,12 +419,12 @@ class EnclaveServer:
             self.key_store.store_user_keys(address, key_pair)
 
             response = {
-                "status": "success",
                 "address": address,
                 "public_key": public_key.to_compressed_bytes().hex(),
                 "verifying_key": verifying_key.to_compressed_bytes().hex(),
             }
-            return json.dumps(response).encode("utf-8")
+            # This calls _success_response which appends state
+            return self._success_response(b"", metadata=response)
 
         except Exception as e:
             return self._error_response(f"Registration failed: {str(e)}")
@@ -299,24 +462,20 @@ class EnclaveServer:
         if user_keys is None:
             return self._error_response("User keys not found")
 
-        # NOTE: maybe implement session token if theres time
-
         response_data = {
-            "status": "success",
             "address": address,
             "public_key": user_keys.public_key.to_compressed_bytes().hex(),
             "verifying_key": user_keys.verifying_key.to_compressed_bytes().hex(),
         }
 
         print(f"[ENCLAVE] Login successful for {address}")
-        return json.dumps(response_data).encode("utf-8")
+        return self._success_response(b"", metadata=response_data)
 
     async def handle_decrypt_capsule(self, request: dict) -> bytes:
         """
         Decrypt a capsule using the user's stored secret key.
 
         This is the ONLY way for clients to get the decrypted AES key.
-        The secret key never leaves the enclave.
 
         Request format:
         {
@@ -364,16 +523,12 @@ class EnclaveServer:
         if not signature or not message:
             return self._error_response("Missing signature or message")
 
-        # Verify Message Binding to CID and Ephemeral Key (MITM Protection)
-        # Message format: "Sign to decrypt file: <CID> with session key: <EPHEMERAL_KEY>"
+        # Verify Message Binding to CID and Ephemeral Key
         expected_message = (
             f"Sign to decrypt file: {cid} with session key: {ephemeral_public_key_hex}"
         )
 
         if message != expected_message:
-            print(
-                f"[ENCLAVE] IMPERSONATION ATTEMPT! Message '{message}' does not match expected '{expected_message}'"
-            )
             return self._error_response(
                 "Invalid signature binding. Message does not match expected format with keys."
             )
@@ -435,7 +590,7 @@ class EnclaveServer:
                     ciphertext=ciphertext,
                 )
 
-            # Return the decrypted AES key
+            # Return the decrypted AES key via Secure Channel
             print(f"[ENCLAVE] Decryption successful for {address}")
 
             # Establish Secure Channel via ECDH
@@ -471,6 +626,19 @@ class EnclaveServer:
         response = {"status": "success", "data": data.hex()}
         if metadata:
             response.update(metadata)
+
+        # Piggyback state persistence if in production mode
+        if not self.is_local and self.key_store.master_key:
+            try:
+                state_bytes = self.key_store.serialize_state()
+                aesgcm = AESGCM(self.key_store.master_key)
+                nonce = os.urandom(12)
+                ciphertext = aesgcm.encrypt(nonce, state_bytes, None)
+                encrypted_state = (nonce + ciphertext).hex()
+                response["new_encrypted_state"] = encrypted_state
+            except Exception as e:
+                print(f"Failed to encrypt state for persistence: {e}")
+
         return json.dumps(response).encode("utf-8")
 
     def _verify_signature(
@@ -498,10 +666,8 @@ class EnclaveServer:
 
     def _derive_shared_key(self, peer_public_key_hex: str) -> bytes:
         """
-        Derive a shared session key using ECDH (Enclave Ephemeral Private Key + Peer Ephemeral Public Key).
+        Derive a shared session key using ECDH.
         """
-        # 1. Parse client's ephemeral public key
-        # (Client sends raw uncompressed bytes hex-encoded, possibly with 0x prefix)
         if peer_public_key_hex.startswith("0x"):
             peer_public_key_hex = peer_public_key_hex[2:]
 
@@ -512,14 +678,14 @@ class EnclaveServer:
             ec.SECP256R1(), peer_public_bytes
         )
 
-        # 2. Generate Enclave's Ephemeral Key Pair
+        # Generate Enclave's Ephemeral Key Pair
         enclave_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
         enclave_public_key = enclave_private_key.public_key()
 
-        # 3. Perform ECDH
+        # Perform ECDH
         shared_secret = enclave_private_key.exchange(ec.ECDH(), peer_public_key)
 
-        # 4. Derive Session Key using HKDF
+        # Derive Session Key using HKDF
         derived_key = HKDF(
             algorithm=hashes.SHA256(),
             length=32,  # AES-256
@@ -538,7 +704,6 @@ class EnclaveServer:
 
     def _encrypt_response(self, plaintext_data: bytes, key: bytes) -> dict:
         """Encrypt the response data using AES-GCM."""
-        # Use AES-GCM for authenticated encryption
         aesgcm = AESGCM(key)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, plaintext_data, None)
@@ -574,9 +739,12 @@ class VSockServer:
         try:
             while True:
                 # Read message length (4 bytes, big-endian)
-                length_bytes = await reader.readexactly(4)
+                try:
+                    length_bytes = await reader.readexactly(4)
+                except asyncio.IncompleteReadError:
+                    break  # Connection closed
+
                 message_length = int.from_bytes(length_bytes, "big")
-                print(f"[ENCLAVE] Received message length: {message_length}")
 
                 if message_length <= 0 or message_length > 10 * 1024 * 1024:  # Max 10MB
                     print(f"Invalid message length: {message_length}")
