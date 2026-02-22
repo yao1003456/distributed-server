@@ -198,10 +198,20 @@ class SecureKeyStore:
         return False
 
     def serialize_state(self) -> bytes:
-        """Serialize keys using pickle."""
-        # We only serialize the user keys and proxy keys, not the master key itself
+        """Serialize keys to bytes-safe dict before pickling.
+
+        umbral_pre objects are Rust-backed (PyO3) and cannot be pickled
+        directly. We convert each key to raw bytes first.
+        """
+        serialized_users = {}
+        for addr, kp in self.user_keys.items():
+            serialized_users[addr] = {
+                "secret_key": kp.secret_key.to_be_bytes(),
+                "signing_key": kp.signing_key.to_be_bytes(),
+            }
+
         state = {
-            "user_keys": self.user_keys,
+            "user_keys": serialized_users,
             "proxy_keys": {
                 "secret": self.proxy_secret_key.to_be_bytes(),
                 "signing": self.proxy_signing_key.to_be_bytes(),
@@ -210,15 +220,26 @@ class SecureKeyStore:
         return pickle.dumps(state)
 
     def load_state(self, state_bytes: bytes):
+        """Deserialize state and reconstruct umbral key objects."""
         state = pickle.loads(state_bytes)
-        self.user_keys = state.get("user_keys", {})
+
+        raw_users = state.get("user_keys", {})
+        self.user_keys = {}
+        for addr, key_data in raw_users.items():
+            sk = SecretKey.from_be_bytes(key_data["secret_key"])
+            signing_sk = SecretKey.from_be_bytes(key_data["signing_key"])
+            self.user_keys[addr] = UserKeyPair(
+                secret_key=sk,
+                public_key=sk.public_key(),
+                signing_key=signing_sk,
+                verifying_key=signing_sk.public_key(),
+            )
 
         # Restore proxy identity
         p_keys = state.get("proxy_keys", {})
         if p_keys:
             self.proxy_secret_key = SecretKey.from_be_bytes(p_keys["secret"])
             self.proxy_signing_key = SecretKey.from_be_bytes(p_keys["signing"])
-            # Re-derive public keys
             self.__post_init__()
 
 
@@ -630,6 +651,19 @@ class EnclaveServer:
             try:
                 shared_key = self._derive_shared_key(ephemeral_public_key_hex)
                 encrypted_response = self._encrypt_response(plaintext, shared_key)
+
+                # Piggyback state persistence (same as _success_response)
+                if not self.is_local and self.key_store.master_key:
+                    try:
+                        state_bytes = self.key_store.serialize_state()
+                        aesgcm = AESGCM(self.key_store.master_key)
+                        nonce = os.urandom(12)
+                        ct = aesgcm.encrypt(nonce, state_bytes, None)
+                        encrypted_response["new_encrypted_state"] = (nonce + ct).hex()
+                    except Exception as e:
+                        print(f"[ENCLAVE] State persistence failed during decrypt: {e}")
+                        encrypted_response["state_warning"] = str(e)
+
                 return json.dumps(encrypted_response).encode("utf-8")
             except Exception as e:
                 print(f"[ENCLAVE] Secure channel error: {e}")
@@ -670,7 +704,8 @@ class EnclaveServer:
                 encrypted_state = (nonce + ciphertext).hex()
                 response["new_encrypted_state"] = encrypted_state
             except Exception as e:
-                print(f"Failed to encrypt state for persistence: {e}")
+                print(f"[ENCLAVE] CRITICAL: State persistence failed: {e}")
+                response["state_warning"] = str(e)
 
         return json.dumps(response).encode("utf-8")
 

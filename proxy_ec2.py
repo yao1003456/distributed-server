@@ -112,6 +112,13 @@ def process_enclave_response(response_bytes: bytes | None) -> dict | None:
         elif master_key and initial_state:
             save_enclave_state(master_key, initial_state)
 
+        # Surface state persistence warnings from enclave
+        state_warning = data.get("state_warning")
+        if state_warning:
+            logger.error(
+                f"[EC2] CRITICAL: Enclave state persistence failed: {state_warning}"
+            )
+
         if data.get("status") == "error":
             logger.error(f"Enclave Error: {data.get('message')}")
             return data
