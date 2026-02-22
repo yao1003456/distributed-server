@@ -660,24 +660,65 @@ async def verify_siwe(request: Request):
 async def decrypt_capsule(request: Request):
     """
     Request enclave to decrypt a capsule.
+    Handles blockchain fetch and optional re-encryption if the requester is not the owner.
     """
     try:
         body = await request.json()
         address = body.get("address")
-        capsule_hex = body.get("capsule")  # Original or re-encrypted capsule
         cid = body.get("cid")
-        is_reencrypted = body.get("is_reencrypted", False)
-        owner_address = body.get("owner", "")  # Required for re-encrypted capsules
         signature = body.get("signature")
         message = body.get("message")
-        cfrag = body.get("cfrag", "")
         ephemeral_public_key = body.get("ephemeral_public_key")
 
-        if not address or not capsule_hex:
-            return {"status": "error", "message": "Missing address or capsule"}
+        if not address or not cid:
+            return {"status": "error", "message": "Missing address or cid"}
 
-        # Verify on-chain access status if not the owner
-        if cid and owner_address and address.lower() != owner_address.lower():
+        logger.info(f"[EC2] Decrypt capsule request for {address} on {cid}")
+
+        # 1. Fetch from blockchain
+        try:
+            logger.info(f"[EC2] Fetching file data from blockchain for {cid}")
+            file_data = await fetch_file_blockchain(cid)
+            # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
+            chain_owner = file_data[0]
+            capsule = file_data[2]
+            ciphertext_bytes = file_data[3]
+
+            ciphertext_hex = ciphertext_bytes.hex()
+
+            # Convert capsule bytes to hex
+            if isinstance(capsule, str):
+                capsule_bytes = bytes.fromhex(capsule.replace("0x", ""))
+            elif isinstance(capsule, bytes):
+                capsule_bytes = capsule
+            else:
+                capsule_bytes = bytes(capsule)
+
+            capsule_hex = capsule_bytes.hex()
+
+            logger.info(
+                f"[EC2] Chain owner: {chain_owner}, Ciphertext length: {len(ciphertext_hex)}"
+            )
+        except Exception as e:
+            logger.error(f"[EC2] Failed to fetch data from chain: {e}")
+            return {
+                "status": "error",
+                "message": "Failed to fetch file data from blockchain",
+            }
+
+        if not ciphertext_hex:
+            return {"status": "error", "message": "Ciphertext not found on-chain"}
+
+        redis_client = await get_redis()
+        is_reencrypted = False
+        cfrag_hex = ""
+
+        # 2. Check if requester wants someone else's file
+        if address.lower() != chain_owner.lower():
+            logger.info(
+                f"[EC2] Requester {address} is not the owner. Checking access and re-encrypting..."
+            )
+            # Verify on-chain access status
             try:
                 contract, w3 = await get_contract()
                 status = await contract.functions.getAccessStatus(cid, address).call()
@@ -689,28 +730,52 @@ async def decrypt_capsule(request: Request):
                         "message": "Access not approved on-chain",
                     }
             except Exception as e:
-                logger.warning(f"Warning: Could not verify on-chain access: {e}")
+                logger.error(f"Access verification failed: {e}")
+                return {"status": "error", "message": "Access verification failed"}
 
-        logger.info(f"[EC2] Decrypt capsule request for {address}")
-        ciphertext_hex = None
-        try:
-            logger.info(f"[EC2] Fetching ciphertext from blockchain for {cid}")
-            file_data = await fetch_file_blockchain(cid)
-            # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
-            ciphertext_bytes = file_data[3]
-            ciphertext_hex = ciphertext_bytes.hex()
-            logger.info(f"[EC2] Ciphertext length: {len(ciphertext_hex)}")
-        except Exception as e:
-            logger.error(f"[EC2] Failed to fetch ciphertext from chain: {e}")
-            return {
-                "status": "error",
-                "message": "Failed to fetch ciphertext from blockchain",
-            }
+            # Get re-encryption key (RK)
+            rk = await get_rk(redis_client, chain_owner, address)
+            if not rk:
+                return {
+                    "status": "error",
+                    "message": "could not obtain re-encryption key",
+                }
+            logger.info(f"[EC2] RK retrieved for {chain_owner}->{address}")
 
-        if not ciphertext_hex:
-            return {"status": "error", "message": "Ciphertext not found on-chain"}
+            # Get public keys for kfrag verification
+            owner_pk_bytes, owner_vk_bytes = await get_public_key(
+                redis_client, chain_owner
+            )
+            requester_pk_bytes, _ = await get_public_key(redis_client, address)
 
-        # Forward to enclave for decryption
+            if not owner_pk_bytes or not owner_vk_bytes:
+                return {"status": "error", "message": "owner not registered in enclave"}
+            if not requester_pk_bytes:
+                return {
+                    "status": "error",
+                    "message": "requester not registered in enclave",
+                }
+
+            # Perform re-encryption
+            try:
+                logger.info("[EC2] Re-encrypting capsule locally...")
+                reenc_capsule = await reencrypt_capsule(
+                    rk_bytes=rk,
+                    capsule_bytes=capsule_bytes,
+                    owner_pk_bytes=owner_pk_bytes,
+                    owner_vk_bytes=owner_vk_bytes,
+                    requester_pk_bytes=requester_pk_bytes,
+                )
+                cfrag_hex = reenc_capsule.hex()
+                is_reencrypted = True
+                logger.info("[EC2] Re-encryption successful")
+            except Exception as e:
+                logger.error(f"Re-encryption failed: {e}")
+                return {"status": "error", "message": "Re-encryption failed"}
+        else:
+            logger.info("[EC2] Requester is the owner. Direct decryption.")
+
+        # 3. Forward to enclave for decryption
         logger.info("[EC2] Forwarding decrypt request to enclave")
         payload = json.dumps(
             {
@@ -720,8 +785,8 @@ async def decrypt_capsule(request: Request):
                 "ciphertext": ciphertext_hex,
                 "cid": cid,
                 "is_reencrypted": is_reencrypted,
-                "cfrag": cfrag,
-                "owner": owner_address,
+                "cfrag": cfrag_hex,
+                "owner": chain_owner,
                 "signature": signature,
                 "message": message,
                 "ephemeral_public_key": ephemeral_public_key,
@@ -740,83 +805,3 @@ async def decrypt_capsule(request: Request):
     except Exception as e:
         logger.error(f"Decryption failed: {str(e)}")
         return {"status": "error", "message": "Decryption failed"}
-
-
-@app.get("/api/capsule/{cid}")
-async def get_capsule(cid: str, requester: str, owner: str):
-    """Get re-encrypted capsule for a file."""
-    logger.info(f"[EC2] Get capsule request: cid={cid}, requester={requester}")
-    redis = await get_redis()
-
-    # Verify on-chain access status first
-    try:
-        contract, w3 = await get_contract()
-        status = await contract.functions.getAccessStatus(cid, requester).call()
-        # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
-        if status != 2:
-            logger.warning(f"[EC2] Access not approved for {requester} on {cid}")
-            return {"status": "error", "message": "Access not approved on-chain"}
-    except Exception as e:
-        logger.error(f"Access verification failed: {e}")
-        return {"status": "error", "message": "Access verification failed"}
-
-    # Fetch file data from blockchain
-    try:
-        file_data = await fetch_file_blockchain(cid)
-        chain_owner = file_data[0]
-        capsule = file_data[2]  # Now bytes from contract
-        # Convert bytes to proper format if needed
-        if isinstance(capsule, str):
-            capsule = bytes.fromhex(capsule.replace("0x", ""))
-        elif isinstance(capsule, bytes):
-            pass  # Already bytes
-        else:
-            # It might be returned as a hex string with 0x prefix
-            capsule = bytes(capsule)
-        logger.info(f"[EC2] Chain owner: {chain_owner}")
-    except Exception as e:
-        logger.error(f"Chain fetch failed: {e}")
-        return {"status": "error", "message": "Failed to fetch file data"}
-
-    if chain_owner.lower() != owner.lower():
-        logger.warning(f"Owner mismatch: {chain_owner} != {owner}")
-        return {"status": "error", "message": "owner mismatch"}
-
-    # Get re-encryption key
-    rk = await get_rk(redis, owner, requester)
-    if not rk:
-        return {"status": "error", "message": "could not obtain re-encryption key"}
-    logger.info(f"[EC2] RK retrieved for {owner}->{requester}")
-
-    # Get public keys and verifying keys for kfrag verification
-    owner_pk_bytes, owner_vk_bytes = await get_public_key(redis, owner)
-    requester_pk_bytes, _ = await get_public_key(redis, requester)
-
-    if not owner_pk_bytes or not owner_vk_bytes:
-        return {"status": "error", "message": "owner not registered in enclave"}
-    if not requester_pk_bytes:
-        return {"status": "error", "message": "requester not registered in enclave"}
-
-    # Perform re-encryption
-    try:
-        logger.info("[EC2] Re-encrypting capsule...")
-        reenc_capsule = await reencrypt_capsule(
-            rk_bytes=rk,
-            capsule_bytes=capsule,
-            owner_pk_bytes=owner_pk_bytes,
-            owner_vk_bytes=owner_vk_bytes,
-            requester_pk_bytes=requester_pk_bytes,
-        )
-        logger.info("[EC2] Re-encryption successful")
-    except Exception as e:
-        logger.error(f"Re-encryption failed: {e}")
-        return {"status": "error", "message": "Re-encryption failed"}
-
-    return {
-        "status": "success",
-        "cid": cid,
-        "owner": owner,
-        "requester": requester,
-        "cfrag": reenc_capsule.hex(),
-        "original_capsule": capsule.hex(),
-    }
