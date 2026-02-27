@@ -18,6 +18,7 @@ import secrets
 import subprocess
 import base64
 import pickle
+import time
 from typing import Optional
 from dataclasses import dataclass, field
 from umbral_pre import (
@@ -33,6 +34,7 @@ from umbral_pre import (
 )
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from siwe import SiweMessage
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -172,6 +174,9 @@ class SecureKeyStore:
     proxy_public_key: PublicKey = field(init=False)
     proxy_signing_key: SecretKey = field(default_factory=SecretKey.random)
     proxy_verifying_key: PublicKey = field(init=False)
+
+    # In-memory store for used nonces to prevent replay attacks
+    used_nonces: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         self.proxy_public_key = self.proxy_secret_key.public_key()
@@ -503,9 +508,11 @@ class EnclaveServer:
         if not address:
             return self._error_response("Missing address")
 
-        # Verify Ethereum signature
-        if not self._verify_signature(address, message, signature):
-            return self._error_response("Invalid signature")
+        # Verify Ethereum signature using Strict SIWE parsing
+        try:
+            self._verify_signature(address, message, signature, is_siwe=True)
+        except Exception as e:
+            return self._error_response(f"Invalid signature or replay attack: {str(e)}")
 
         # create user if not exists, else return user keys
         if not self.key_store.has_user(address):
@@ -588,8 +595,10 @@ class EnclaveServer:
             )
 
         # Verify the signature against the STRICTLY formatted message
-        if not self._verify_signature(address, message, signature):
-            return self._error_response("Invalid signature for decryption")
+        try:
+            self._verify_signature(address, message, signature, is_siwe=False)
+        except Exception as e:
+            return self._error_response(f"Invalid signature for decryption: {str(e)}")
 
         # Get the requester's keys
         user_keys = self.key_store.get_user_keys(address)
@@ -710,22 +719,49 @@ class EnclaveServer:
         return json.dumps(response).encode("utf-8")
 
     def _verify_signature(
-        self, address: str, message_text: str, signature: str
+        self, address: str, message_text: str, signature: str, is_siwe: bool = False
     ) -> bool:
-        """Verify Ethereum signature recovers to address."""
+        """Verify Ethereum signature recovers to address and optionally parses valid SIWE message."""
+        if not message_text or not signature:
+            raise ValueError("Missing message or signature")
+
         try:
-            from eth_account import Account
-            from eth_account.messages import encode_defunct
-
-            if not message_text or not signature:
-                return False
-
+            # 1. Math verification using eth_account
             msg = encode_defunct(text=message_text)
             recovered = Account.recover_message(msg, signature=signature)
-            return recovered.lower() == address.lower()
+            if recovered.lower() != address.lower():
+                raise ValueError(
+                    f"Recovered address {recovered} does not match {address}"
+                )
+
+            # 2. Strict SIWE parsing to prevent Replay Attacks (if requested)
+            if is_siwe:
+                siwe_message = SiweMessage.from_message(message_text)
+
+                # 3. Check Nonce Replay
+                nonce = siwe_message.nonce
+                current_time = time.time()
+
+                # Clean up old nonces (TTL: 1 hour)
+                expired = [
+                    k
+                    for k, v in self.key_store.used_nonces.items()
+                    if current_time - v > 3600
+                ]
+                for k in expired:
+                    del self.key_store.used_nonces[k]
+
+                if nonce in self.key_store.used_nonces:
+                    raise ValueError("Nonce already used. Replay attack detected.")
+
+                # Record nonce
+                self.key_store.used_nonces[nonce] = current_time
+
+            return True
+
         except Exception as e:
             print(f"Signature verification failed: {e}")
-            return False
+            raise ValueError(str(e))
 
     def _error_response(self, message: str) -> bytes:
         """Create an error response."""

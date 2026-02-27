@@ -290,16 +290,19 @@ async def fetch_file_blockchain(cid: str):
     return file
 
 
-async def get_rk(redis, owner: str, requester: str):
-    """Get re-encryption key from cache or enclave."""
+async def get_rk(owner: str, requester: str):
+    """Get re-encryption key from cache or enclave (on-demand)."""
+    redis = await get_redis()
     logger.info(f"[EC2] Fetching RK for {owner}->{requester}")
     rk_key = f"rk:{owner.lower()}:{requester.lower()}"
     rk = await redis.get(rk_key)
     if rk:
-        logger.info(f"[EC2] RK found in cache")
+        logger.info(f"[EC2] RK found in cache for {owner}->{requester}")
         return rk
 
-    logger.info(f"[EC2] RK not in cache, requesting from enclave...")
+    logger.info(
+        f"[EC2] RK not in cache, requesting from enclave for {owner}->{requester}..."
+    )
     payload = json.dumps(
         {
             "action": "get_rk",
@@ -402,102 +405,6 @@ async def reencrypt_capsule(
         raise ValueError(f"Re-encryption failed: {str(e)}")
 
 
-async def event_listener():
-    # Only run event listener if Contract Address is set
-    if not CONTRACT_ADDRESS:
-        logger.info("CONTRACT_ADDRESS not set, skipping event listener")
-        return
-
-    contract, w3 = await get_contract()
-    redis = await get_redis()
-
-    # Get the latest block as starting point
-    try:
-        latest_block = await w3.eth.block_number
-    except:
-        logger.error("Could not fetch block number, skipping event listener startup")
-        return
-
-    while True:
-        try:
-            current_block = await w3.eth.block_number
-
-            if current_block > latest_block:
-                # Fetch AccessGranted events
-                access_granted_events = await contract.events.accessGranted.get_logs(
-                    from_block=latest_block + 1, to_block=current_block
-                )
-
-                # Fetch AccessDenied events
-                access_denied_events = await contract.events.accessDenied.get_logs(
-                    from_block=latest_block + 1, to_block=current_block
-                )
-
-                access_revoked_events = await contract.events.accessRevoked.get_logs(
-                    from_block=latest_block + 1, to_block=current_block
-                )
-
-                # Handle AccessGranted events
-                for event in access_granted_events:
-                    cid = event["args"]["cid"]
-                    owner = event["args"]["owner"]
-                    requester = event["args"]["requester"]
-
-                    # fetch/cache usage of rk using helper function
-                    rk = await get_rk(redis, owner, requester)
-                    if rk:
-                        logger.info(
-                            f"RK ensured for owner={owner}, requester={requester}"
-                        )
-                    else:
-                        logger.error(
-                            f"Failed to obtain RK for owner={owner}, requester={requester}"
-                        )
-
-                # Handle AccessDenied events
-                for event in access_denied_events:
-                    owner = event["args"]["owner"]
-                    requester = event["args"]["requester"]
-
-                    # remove rk from redis
-                    rk_key = f"rk:{owner.lower()}:{requester.lower()}"
-                    deleted = await redis.delete(rk_key)
-
-                    if deleted:
-                        logger.info(
-                            f"Removed RK for owner={owner}, requester={requester}"
-                        )
-                    else:
-                        logger.warning(
-                            f"No RK found to remove for owner={owner}, requester={requester}"
-                        )
-
-                # Handle AccessRevoked events
-                for event in access_revoked_events:
-                    owner = event["args"]["owner"]
-                    requester = event["args"]["user"]
-
-                    # remove rk from redis
-                    rk_key = f"rk:{owner.lower()}:{requester.lower()}"
-                    deleted = await redis.delete(rk_key)
-
-                    if deleted:
-                        logger.info(
-                            f"Removed RK for owner={owner}, requester={requester}"
-                        )
-                    else:
-                        logger.warning(
-                            f"No RK found to remove for owner={owner}, requester={requester}"
-                        )
-
-                latest_block = current_block
-
-        except Exception as e:
-            logger.error(f"Event listener error: {e}")
-
-        await asyncio.sleep(5)
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global redis_pool, w3_client
@@ -523,14 +430,8 @@ async def lifespan(_: FastAPI):
     # Init Enclave
     await init_enclave()
 
-    task = asyncio.create_task(event_listener())
     yield
     # Shutdown
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
     if redis_pool:
         await redis_pool.close()
 
@@ -733,8 +634,8 @@ async def decrypt_capsule(request: Request):
                 logger.error(f"Access verification failed: {e}")
                 return {"status": "error", "message": "Access verification failed"}
 
-            # Get re-encryption key (RK)
-            rk = await get_rk(redis_client, chain_owner, address)
+            # Get re-encryption key (RK) on-demand
+            rk = await get_rk(chain_owner, address)
             if not rk:
                 return {
                     "status": "error",
