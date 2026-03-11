@@ -641,9 +641,8 @@ async def decrypt_capsule(request: Request):
                 }
             logger.info(f"[EC2] RK retrieved for {chain_owner}->{address}")
 
-            requester_pk_bytes, owner_vk_bytes = await get_public_key(
-                redis_client, address
-            )
+            owner_pk_bytes, owner_vk_bytes = await get_public_key(redis_client, chain_owner)
+            requester_pk_bytes, _ = await get_public_key(redis_client, address)
 
             if not owner_pk_bytes or not owner_vk_bytes:
                 return {"status": "error", "message": "owner not registered in enclave"}
