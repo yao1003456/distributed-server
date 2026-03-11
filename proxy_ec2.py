@@ -458,8 +458,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# TODO: use Redis in production
-# In-memory nonce store (use Redis in production)
 nonce_store: dict[str, float] = {}
 NONCE_EXPIRY_SECONDS = 300  # 5 minutes
 
@@ -623,7 +621,7 @@ async def decrypt_capsule(request: Request):
             try:
                 contract, w3 = await get_contract()
                 status = await contract.functions.getAccessStatus(cid, address).call()
-                # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED
+                # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED, 4=REVOKED
                 if status != 2:
                     logger.warning(f"[EC2] Access not approved for {address} on {cid}")
                     return {
@@ -643,11 +641,9 @@ async def decrypt_capsule(request: Request):
                 }
             logger.info(f"[EC2] RK retrieved for {chain_owner}->{address}")
 
-            # Get public keys for kfrag verification
-            owner_pk_bytes, owner_vk_bytes = await get_public_key(
-                redis_client, chain_owner
+            requester_pk_bytes, owner_vk_bytes = await get_public_key(
+                redis_client, address
             )
-            requester_pk_bytes, _ = await get_public_key(redis_client, address)
 
             if not owner_pk_bytes or not owner_vk_bytes:
                 return {"status": "error", "message": "owner not registered in enclave"}
