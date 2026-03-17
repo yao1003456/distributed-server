@@ -560,7 +560,22 @@ async def decrypt_capsule(request: Request):
     """
     Request enclave to decrypt a capsule.
     Handles blockchain fetch and optional re-encryption if the requester is not the owner.
+
+    On success the response JSON contains the encrypted AES key plus a ``timings``
+    dict with per-segment latency in milliseconds:
+        - total_server_ms: Full endpoint time.
+        - blockchain_fetch_ms: Time to fetch file data from blockchain.
+        - access_check_ms: Time to verify on-chain access status (non-owner only).
+        - rk_fetch_ms: Time to obtain re-encryption key (non-owner only).
+        - pk_fetch_ms: Time to fetch public keys from cache/enclave (non-owner only).
+        - reencrypt_ms: Time to re-encrypt capsule on EC2 (non-owner only).
+        - enclave_decrypt_ms: Time for enclave decryption round-trip.
     """
+    import time
+
+    t_total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
     try:
         body = await request.json()
         address = body.get("address")
@@ -577,7 +592,9 @@ async def decrypt_capsule(request: Request):
         # 1. Fetch from blockchain
         try:
             logger.info(f"[EC2] Fetching file data from blockchain for {cid}")
+            t0 = time.perf_counter()
             file_data = await fetch_file_blockchain(cid)
+            timings["blockchain_fetch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
             # file_data structure: (owner, cid, capsule, ciphertext, exist) per ABI
             chain_owner = file_data[0]
             capsule = file_data[2]
@@ -619,8 +636,10 @@ async def decrypt_capsule(request: Request):
             )
             # Verify on-chain access status
             try:
+                t0 = time.perf_counter()
                 contract, w3 = await get_contract()
                 status = await contract.functions.getAccessStatus(cid, address).call()
+                timings["access_check_ms"] = round((time.perf_counter() - t0) * 1000, 2)
                 # AccessStatus enum: 0=NONE, 1=PENDING, 2=APPROVED, 3=DENIED, 4=REVOKED
                 if status != 2:
                     logger.warning(f"[EC2] Access not approved for {address} on {cid}")
@@ -633,7 +652,9 @@ async def decrypt_capsule(request: Request):
                 return {"status": "error", "message": "Access verification failed"}
 
             # Get re-encryption key (RK) on-demand
+            t0 = time.perf_counter()
             rk = await get_rk(chain_owner, address)
+            timings["rk_fetch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
             if not rk:
                 return {
                     "status": "error",
@@ -641,8 +662,10 @@ async def decrypt_capsule(request: Request):
                 }
             logger.info(f"[EC2] RK retrieved for {chain_owner}->{address}")
 
+            t0 = time.perf_counter()
             owner_pk_bytes, owner_vk_bytes = await get_public_key(redis_client, chain_owner)
             requester_pk_bytes, _ = await get_public_key(redis_client, address)
+            timings["pk_fetch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
             if not owner_pk_bytes or not owner_vk_bytes:
                 return {"status": "error", "message": "owner not registered in enclave"}
@@ -655,6 +678,7 @@ async def decrypt_capsule(request: Request):
             # Perform re-encryption
             try:
                 logger.info("[EC2] Re-encrypting capsule locally...")
+                t0 = time.perf_counter()
                 reenc_capsule = await reencrypt_capsule(
                     rk_bytes=rk,
                     capsule_bytes=capsule_bytes,
@@ -662,6 +686,7 @@ async def decrypt_capsule(request: Request):
                     owner_vk_bytes=owner_vk_bytes,
                     requester_pk_bytes=requester_pk_bytes,
                 )
+                timings["reencrypt_ms"] = round((time.perf_counter() - t0) * 1000, 2)
                 cfrag_hex = reenc_capsule.hex()
                 is_reencrypted = True
                 logger.info("[EC2] Re-encryption successful")
@@ -689,11 +714,17 @@ async def decrypt_capsule(request: Request):
             }
         ).encode()
 
+        t0 = time.perf_counter()
         response = await forward_enclave(payload)
+        timings["enclave_decrypt_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         data = process_enclave_response(response)  # Use helper
+
+        timings["total_server_ms"] = round((time.perf_counter() - t_total_start) * 1000, 2)
+        logger.info(f"[EC2] Timings: {timings}")
 
         if data and data.get("status") == "success":
             logger.info("[EC2] Decrypt successful")
+            data["timings"] = timings
             return data
         else:
             return data if data else {"status": "error", "message": "Enclave error"}
@@ -701,3 +732,4 @@ async def decrypt_capsule(request: Request):
     except Exception as e:
         logger.error(f"Decryption failed: {str(e)}")
         return {"status": "error", "message": "Decryption failed"}
+

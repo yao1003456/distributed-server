@@ -378,7 +378,8 @@ class EnclaveServer:
             "requester": "0x..."
         }
 
-        Returns: Serialized VerifiedKeyFrag bytes
+        Returns: JSON with serialized VerifiedKeyFrag hex and timings:
+            - kfrag_generation_ms: Time for generate_kfrags() call.
         """
         owner = (request.get("owner") or "").lower()
         requester = (request.get("requester") or "").lower()
@@ -395,6 +396,7 @@ class EnclaveServer:
 
             signer = Signer(owner_keys.signing_key)
 
+            t0 = time.perf_counter()
             kfrags = generate_kfrags(
                 delegating_sk=owner_keys.secret_key,
                 receiving_pk=requester_keys.public_key,
@@ -404,10 +406,14 @@ class EnclaveServer:
                 sign_delegating_key=True,
                 sign_receiving_key=True,
             )
+            kfrag_generation_ms = round((time.perf_counter() - t0) * 1000, 2)
 
             kfrag_bytes = bytes(kfrags[0])
 
-            return self._success_response(kfrag_bytes)
+            return self._success_response(
+                kfrag_bytes,
+                metadata={"timings": {"kfrag_generation_ms": kfrag_generation_ms}},
+            )
 
         except Exception as e:
             print(f"Error generating RK: {e}")
@@ -451,7 +457,8 @@ class EnclaveServer:
             "address": "0x...", (wallet address)
         }
 
-        Returns: User's public key bytes
+        Returns: JSON with user's public key hex and timings:
+            - key_generation_ms: Time for SecretKey + PublicKey generation.
         """
         address = request.get("address", "").lower()
         print(f"[ENCLAVE] Registering user: {address}")
@@ -461,12 +468,14 @@ class EnclaveServer:
 
         try:
             # Generate new key pair for user
+            t0 = time.perf_counter()
             secret_key = SecretKey.random()
             public_key = secret_key.public_key()
 
             # Generate signing key pair
             signing_key = SecretKey.random()
             verifying_key = signing_key.public_key()
+            key_generation_ms = round((time.perf_counter() - t0) * 1000, 2)
 
             key_pair = UserKeyPair(
                 secret_key=secret_key,
@@ -481,6 +490,7 @@ class EnclaveServer:
                 "address": address,
                 "public_key": public_key.to_compressed_bytes().hex(),
                 "verifying_key": verifying_key.to_compressed_bytes().hex(),
+                "timings": {"key_generation_ms": key_generation_ms},
             }
             # This calls _success_response which appends state
             return self._success_response(b"", metadata=response)
@@ -552,8 +562,14 @@ class EnclaveServer:
             "message": "..." (message signed by wallet)
         }
 
-        Returns: Decrypted plaintext (the AES key)
+        Returns: Encrypted AES key via ECDH secure channel, plus a ``timings``
+        dict with per-operation latency in milliseconds:
+            - signature_verify_ms: Time for _verify_signature().
+            - decrypt_original_ms or decrypt_reencrypted_ms: Time for PRE decryption.
+            - ecdh_derive_ms: Time for _derive_shared_key() + _encrypt_response().
         """
+        enclave_timings: dict[str, float] = {}
+
         address = (request.get("address") or "").lower()
         capsule_hex = request.get("capsule", "")
         ciphertext_hex = request.get("ciphertext", "")
@@ -596,7 +612,11 @@ class EnclaveServer:
 
         # Verify the signature against the STRICTLY formatted message
         try:
+            t0 = time.perf_counter()
             self._verify_signature(address, message, signature, is_siwe=False)
+            enclave_timings["signature_verify_ms"] = round(
+                (time.perf_counter() - t0) * 1000, 2
+            )
         except Exception as e:
             return self._error_response(f"Invalid signature for decryption: {str(e)}")
 
@@ -638,6 +658,7 @@ class EnclaveServer:
                 )
 
                 # Decrypt re-encrypted capsule
+                t0 = time.perf_counter()
                 plaintext = decrypt_reencrypted(
                     receiving_sk=user_keys.secret_key,
                     delegating_pk=owner_keys.public_key,
@@ -645,12 +666,19 @@ class EnclaveServer:
                     verified_cfrags=[verified_cfrag],
                     ciphertext=ciphertext,
                 )
+                enclave_timings["decrypt_reencrypted_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
             else:
                 # Direct decryption (owner decrypting their own file)
+                t0 = time.perf_counter()
                 plaintext = decrypt_original(
                     delegating_sk=user_keys.secret_key,
                     capsule=capsule,
                     ciphertext=ciphertext,
+                )
+                enclave_timings["decrypt_original_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
                 )
 
             # Return the decrypted AES key via Secure Channel
@@ -658,8 +686,14 @@ class EnclaveServer:
 
             # Establish Secure Channel via ECDH
             try:
+                t0 = time.perf_counter()
                 shared_key = self._derive_shared_key(ephemeral_public_key_hex)
                 encrypted_response = self._encrypt_response(plaintext, shared_key)
+                enclave_timings["ecdh_derive_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
+
+                encrypted_response["enclave_timings"] = enclave_timings
 
                 # Piggyback state persistence (same as _success_response)
                 if not self.is_local and self.key_store.master_key:
