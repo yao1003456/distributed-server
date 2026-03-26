@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
-LOG_DIR="${LOG_DIR:-$HOME/logs}"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR}"
 
 mkdir -p "$LOG_DIR"
 STARTUP_LOG="$LOG_DIR/startup.log"
